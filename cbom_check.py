@@ -518,6 +518,52 @@ def load_json(path: str, what: str) -> Any:
         sys.exit(2)
 
 
+def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
+          strict: bool = False) -> dict:
+    """Run every check and return the result document (what --json prints,
+    minus file names). Shared by the CLI and the web page."""
+    findings: list[Finding] = []
+    schema_ok, schema_errors = schema_validate(bom)
+    if not schema_ok:
+        shown = schema_errors[:10]
+        more = f" (+{len(schema_errors) - 10} more)" if len(schema_errors) > 10 else ""
+        findings.append(Finding(
+            "CBOM_SCHEMA_INVALID", ERROR, "$",
+            "Not valid CycloneDX 1.6: " + " | ".join(shown) + more))
+
+    findings += check_components(bom)
+
+    if baseline is not None:
+        findings += check_baseline(bom, baseline)
+
+    extracted: list[Extracted] = []
+    strategy = None
+    if acvp is not None:
+        acvp_findings, extracted, strategy = check_acvp(bom, acvp)
+        findings += acvp_findings
+
+    if strict:
+        for f in findings:
+            if f.severity == WARNING:
+                f.severity, f.promoted_by_strict = ERROR, True
+
+    n_err = sum(f.severity == ERROR for f in findings)
+    n_warn = sum(f.severity == WARNING for f in findings)
+    doc = {
+        "schema": {"version": "1.6", "valid": schema_ok, "errors": schema_errors,
+                   "note": SCHEMA_NOTE},
+        "findings": [asdict(f) for f in findings],
+        "summary": {"errors": n_err, "warnings": n_warn, "strict": strict,
+                    "exit_code": 1 if n_err else 0},
+    }
+    if acvp is not None:
+        doc["acvp_extraction"] = {
+            "strategy": strategy,
+            "algorithms": [{"name": e.token.text, "raw_value": e.raw, "field": e.field}
+                           for e in extracted]}
+    return doc
+
+
 def run(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Semantic checks for CycloneDX CBOMs.")
     ap.add_argument("cbom")
@@ -531,76 +577,44 @@ def run(argv: Optional[list[str]] = None) -> int:
     if not isinstance(bom, dict):
         print("INPUT_ERROR: CBOM top level is not a JSON object", file=sys.stderr)
         return 2
-
-    findings: list[Finding] = []
-    schema_ok, schema_errors = schema_validate(bom)
-    if not schema_ok:
-        shown = schema_errors[:10]
-        more = f" (+{len(schema_errors) - 10} more)" if len(schema_errors) > 10 else ""
-        findings.append(Finding(
-            "CBOM_SCHEMA_INVALID", ERROR, "$",
-            "Not valid CycloneDX 1.6: " + " | ".join(shown) + more))
-
-    findings += check_components(bom)
-
+    base = None
     if args.baseline:
         base = load_json(args.baseline, "baseline")
         if not isinstance(base, dict):
             print("INPUT_ERROR: baseline top level is not a JSON object", file=sys.stderr)
             return 2
-        findings += check_baseline(bom, base)
+    report = load_json(args.acvp, "ACVP report") if args.acvp else None
 
-    extracted: list[Extracted] = []
-    strategy = None
-    if args.acvp:
-        report = load_json(args.acvp, "ACVP report")
-        acvp_findings, extracted, strategy = check_acvp(bom, report)
-        findings += acvp_findings
-
-    if args.strict:
-        for f in findings:
-            if f.severity == WARNING:
-                f.severity, f.promoted_by_strict = ERROR, True
-
-    n_err = sum(f.severity == ERROR for f in findings)
-    n_warn = sum(f.severity == WARNING for f in findings)
-    exit_code = 1 if n_err else 0
+    doc = check(bom, report, base, args.strict)
+    exit_code = doc["summary"]["exit_code"]
 
     if args.json:
-        doc = {
-            "cbom": args.cbom,
-            "schema": {"version": "1.6", "valid": schema_ok, "errors": schema_errors,
-                       "note": SCHEMA_NOTE},
-            "findings": [asdict(f) for f in findings],
-            "summary": {"errors": n_err, "warnings": n_warn, "strict": args.strict,
-                        "exit_code": exit_code},
-        }
+        doc = {"cbom": args.cbom, **doc}
         if args.acvp:
-            doc["acvp_extraction"] = {
-                "report": args.acvp, "strategy": strategy,
-                "algorithms": [{"name": e.token.text, "raw_value": e.raw, "field": e.field}
-                           for e in extracted]}
+            doc["acvp_extraction"] = {"report": args.acvp, **doc["acvp_extraction"]}
         print(json.dumps(doc, indent=2))
         return exit_code
 
+    s = doc["summary"]
     print(f"cbom_check: {args.cbom}")
-    print(f"  Schema (CycloneDX 1.6): {'PASS' if schema_ok else 'FAIL'}")
+    print(f"  Schema (CycloneDX 1.6): {'PASS' if doc['schema']['valid'] else 'FAIL'}")
     print(f"  NOTE: {SCHEMA_NOTE}")
     if args.acvp:
-        print(f"  ACVP report: {args.acvp} -- algorithm names taken from {strategy}:")
-        for e in extracted:
-            raw = "" if e.raw == e.token.text else f" (in {e.raw!r})"
-            print(f"    - {e.token.text!r}{raw} from {e.field}")
+        ex = doc["acvp_extraction"]
+        print(f"  ACVP report: {args.acvp} -- algorithm names taken from {ex['strategy']}:")
+        for e in ex["algorithms"]:
+            raw = "" if e["raw_value"] == e["name"] else f" (in {e['raw_value']!r})"
+            print(f"    - {e['name']!r}{raw} from {e['field']}")
     print()
-    if not findings:
+    if not doc["findings"]:
         print("  No semantic findings.")
-    for f in findings:
-        tag = f.severity.upper() + (" (strict)" if f.promoted_by_strict else "")
-        print(f"  [{tag}] {f.code}")
-        print(f"      at:  {f.location}")
-        print(f"      why: {f.message}")
+    for f in doc["findings"]:
+        tag = f["severity"].upper() + (" (strict)" if f["promoted_by_strict"] else "")
+        print(f"  [{tag}] {f['code']}")
+        print(f"      at:  {f['location']}")
+        print(f"      why: {f['message']}")
     print()
-    print(f"  {n_err} error(s), {n_warn} warning(s)"
+    print(f"  {s['errors']} error(s), {s['warnings']} warning(s)"
           f"{' [--strict: warnings are errors]' if args.strict else ''} -> exit {exit_code}")
     return exit_code
 

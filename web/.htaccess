@@ -1,0 +1,3 @@
+# Apache / LiteSpeed hosts (e.g. shared hosting): serve WebAssembly with the right type.
+AddType application/wasm .wasm
+AddType text/javascript .mjs

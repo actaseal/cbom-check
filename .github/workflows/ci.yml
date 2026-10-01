@@ -19,3 +19,16 @@ jobs:
       - run: pytest -v
       - name: Clean CBOM exits 0
         run: python cbom_check.py fixtures/clean.json --acvp fixtures/acvp_clean.json --baseline fixtures/baseline.json --strict
+
+  web-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: web/.cache
+          key: pyodide-${{ hashFiles('web/build.py') }}
+      - run: python web/build.py

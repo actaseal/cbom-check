@@ -92,6 +92,20 @@ was compared.
 
 `CBOM_ASSETTYPE_IMPLAUSIBLE` is a keyword heuristic and can be wrong; all other checks are deterministic.
 
+## Web version
+
+`web/` builds a static page that runs the same `cbom_check.py` in the browser
+through Pyodide (Python compiled to WebAssembly). Files are read locally and
+never uploaded. Pyodide and every wheel are self-hosted, with versions and
+hashes pinned, so the page makes no third-party requests.
+
+```
+python web/build.py        # writes web/dist/ (~16 MB), upload it to any static host
+```
+
+`.github/workflows/pages.yml` builds and deploys it to GitHub Pages on every
+push to `main`.
+
 ## Tests
 
 ```

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CBOM Check · ActaSeal</title>
+<meta name="description" content="Semantic checks for CycloneDX CBOMs. Schema-valid is not the same as correct. Runs in your browser; files are not uploaded.">
+<style>
+:root {
+  --bg: #f7f7f5; --surface: #ffffff; --text: #1c1d1f; --muted: #5f6368; --line: #e2e2de;
+  --accent: #1f5fbf; --pass: #1e7a46; --pass-bg: #e8f4ec; --fail: #b3261e; --fail-bg: #fbeceb;
+  --warn: #8a5a00; --warn-bg: #fdf3dc; --code-bg: #f0f0ed;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141517; --surface: #1d1f22; --text: #e8e8e6; --muted: #a0a4aa; --line: #2e3135;
+    --accent: #7aa7f0; --pass: #6fcf97; --pass-bg: #17291f; --fail: #f28b82; --fail-bg: #331b1a;
+    --warn: #f2c35b; --warn-bg: #2f2716; --code-bg: #26292d;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 40px 16px 64px; }
+h1 { font-size: 1.75rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+.lede { color: var(--muted); margin: 0 0 24px; }
+.claim { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  padding: 12px 16px; border-radius: 6px; margin-bottom: 24px; }
+.inputs { display: grid; gap: 12px; grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 720px) { .inputs { grid-template-columns: 1fr; } }
+.drop { position: relative; display: flex; flex-direction: column; gap: 4px; padding: 16px;
+  background: var(--surface); border: 1.5px dashed var(--line); border-radius: 8px; cursor: pointer; min-height: 112px; }
+.drop:hover, .drop.over { border-color: var(--accent); }
+.drop.has-file { border-style: solid; border-color: var(--accent); }
+.drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.drop .t { font-weight: 600; }
+.drop .h { color: var(--muted); font-size: 0.875rem; }
+.drop .fname { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8125rem; word-break: break-all; }
+.drop .clear { display: none; position: relative; z-index: 1; align-self: flex-start; background: none; border: 0;
+  color: var(--accent); padding: 0; font: inherit; font-size: 0.8125rem; cursor: pointer; }
+.drop.has-file .clear { display: inline; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; margin: 16px 0 8px; }
+button.primary { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 10px 20px;
+  font: inherit; font-weight: 600; cursor: pointer; }
+@media (prefers-color-scheme: dark) { button.primary { color: #0d1117; } }
+button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
+button.link { background: none; border: 0; color: var(--accent); font: inherit; padding: 0; cursor: pointer; text-decoration: underline; }
+label.strict { display: flex; gap: 8px; align-items: center; }
+#engine { color: var(--muted); font-size: 0.875rem; margin: 0 0 8px; }
+#engine[data-state="error"] { color: var(--fail); }
+.samples { color: var(--muted); font-size: 0.875rem; }
+#results { margin-top: 32px; display: grid; gap: 12px; }
+.verdict { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; padding: 14px 16px; border-radius: 8px; }
+.verdict strong { font-size: 1.25rem; }
+.verdict.pass { background: var(--pass-bg); color: var(--pass); }
+.verdict.fail { background: var(--fail-bg); color: var(--fail); }
+.schema { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+.schema .note { margin: 6px 0 0; font-weight: 600; }
+.extract { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+.extract summary { cursor: pointer; }
+.table-wrap { overflow-x: auto; margin-top: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.875rem; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.mono, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8125rem; }
+.findings { display: grid; gap: 10px; }
+.finding { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--fail);
+  border-radius: 6px; padding: 12px 16px; }
+.finding.warning { border-left-color: var(--warn); }
+.finding header { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.finding .sev { text-transform: uppercase; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; color: var(--fail); }
+.finding.warning .sev { color: var(--warn); }
+.finding code { background: var(--code-bg); padding: 2px 6px; border-radius: 4px; word-break: break-all; }
+.finding .loc { color: var(--muted); margin-top: 4px; word-break: break-all; }
+.finding p { margin: 6px 0 0; }
+.empty { color: var(--pass); font-weight: 600; }
+section.about { margin-top: 48px; border-top: 1px solid var(--line); padding-top: 24px; color: var(--muted); font-size: 0.9375rem; }
+section.about h2 { color: var(--text); font-size: 1.0625rem; margin: 20px 0 6px; }
+section.about ul { padding-left: 20px; margin: 6px 0; }
+section.about code { color: var(--text); }
+</style>
+</head>
+<body>
+<main>
+  <h1>CBOM Check</h1>
+  <p class="lede">Semantic checks for CycloneDX 1.6 Cryptography Bills of Materials.</p>
+  <div class="claim"><strong>Passing the schema does not mean a CBOM is correct.</strong>
+    This checks what the CBOM <em>says</em>: NIST levels against FIPS 203/204/205, asset modelling,
+    incomplete parameter-set names, missing classical algorithms, refresh against a previous version,
+    and agreement with an ACVP test report.</div>
+
+  <p id="engine">Loading Python engine (about 15&nbsp;MB, cached after the first visit)…</p>
+
+  <div class="inputs">
+    <label class="drop" id="drop-cbom">
+      <input type="file" accept=".json,application/json">
+      <span class="t">CBOM</span><span class="h">Required · CycloneDX JSON</span>
+      <span class="fname"></span><button class="clear" type="button">Remove</button>
+    </label>
+    <label class="drop" id="drop-acvp">
+      <input type="file" accept=".json,application/json">
+      <span class="t">ACVP report</span><span class="h">Optional · any vendor JSON</span>
+      <span class="fname"></span><button class="clear" type="button">Remove</button>
+    </label>
+    <label class="drop" id="drop-baseline">
+      <input type="file" accept=".json,application/json">
+      <span class="t">Previous CBOM</span><span class="h">Optional · checks serialNumber/timestamp refresh</span>
+      <span class="fname"></span><button class="clear" type="button">Remove</button>
+    </label>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="run" disabled>Check</button>
+    <label class="strict"><input type="checkbox" id="strict"> Strict (warnings count as errors)</label>
+    <button class="link" id="dl" hidden>Download JSON result</button>
+  </div>
+  <p class="samples">Try a sample:
+    <button class="link" data-sample="nist_level_mismatch.json">wrong NIST level</button> ·
+    <button class="link" data-sample="no_classical_algorithms.json">PQ-only inventory</button> ·
+    <button class="link" data-sample="clean.json">clean CBOM</button></p>
+
+  <div id="results" hidden></div>
+
+  <section class="about">
+    <h2>Checks</h2>
+    <ul>
+      <li><code>CBOM_SCHEMA_INVALID</code>: baseline CycloneDX 1.6 schema validation</li>
+      <li><code>CBOM_ASSET_MISSING_CRYPTO_PROPERTIES</code></li>
+      <li><code>CBOM_ASSETTYPE_IMPLAUSIBLE</code>: heuristic, warning only; the modelling decision is yours</li>
+      <li><code>CBOM_NIST_LEVEL_ON_NON_ALGORITHM</code>, <code>CBOM_NIST_LEVEL_MISMATCH</code></li>
+      <li><code>CBOM_PARAMETER_SET_NAME_INCOMPLETE</code>, <code>CBOM_NO_CLASSICAL_ALGORITHMS</code></li>
+      <li><code>CBOM_SERIALNUMBER_NOT_REFRESHED</code>, <code>CBOM_TIMESTAMP_NOT_REFRESHED</code></li>
+      <li><code>ACVP_ALGORITHM_NOT_IN_CBOM</code>, <code>CBOM_ALGORITHM_NOT_TESTED</code>, <code>ALGORITHM_NAME_MISMATCH</code></li>
+    </ul>
+    <h2>Limits</h2>
+    <p>The assetType check is a heuristic; every other check is deterministic. It does not check
+      inventory completeness, key lengths, certificate contents, or whether an ACVP report is genuine.
+      Self-run test vectors are not CAVP validation.</p>
+    <h2>Privacy</h2>
+    <p>The checker is Python running in your browser (Pyodide). Your files are read locally and
+      never sent anywhere. The same code runs as a CLI:
+      <code>python cbom_check.py cbom.json --acvp report.json --baseline old.json --strict</code></p>
+  </section>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
