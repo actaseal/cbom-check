@@ -50,8 +50,11 @@ class Finding:
 # Matching is case-insensitive; separators '-', '_', ' ' or none are accepted.
 
 _S = r"[-_ ]?"
-_LB = r"(?<![A-Za-z0-9])"
-_LA = r"(?![A-Za-z0-9])"
+# Boundaries: a name may not start right after a letter or end right before
+# one, except after a digit ('X25519MLKEM768') and around 'with'
+# ('SHA256withRSA', 'ECDSAwithSHA256').
+_LB = r"(?:(?<![A-Za-z])|(?<=with))"
+_LA = r"(?:(?<=\d)(?!\d)|(?![A-Za-z0-9])|(?=with))"
 
 
 def _hash_id(kind: Optional[str], size: str, trunc: Optional[str] = None) -> str:
@@ -87,21 +90,25 @@ _CATALOGUE: list[tuple[str, str, Any]] = [
     ("X25519", r"(?P<fam>X25519)", lambda m: None),
     ("X448", r"(?P<fam>X448)", lambda m: None),
     ("ECDSA", r"(?P<fam>ECDSA)", lambda m: None),
+    ("DSA", r"(?P<fam>DSA)", lambda m: None),
     ("ECDH", r"(?P<fam>ECDHE?|KAS-ECC(?:-SSC)?)", lambda m: None),
     ("DH", r"(?P<fam>FFDHE?|DHE?|Diffie[-_ ]?Hellman|KAS-FFC(?:-SSC)?)", lambda m: None),
-    ("RSA", r"(?P<fam>RSA(?:SSA|ES)?)(?:[-_ ]?(?:1024|2048|3072|4096|8192)(?!\d))?", lambda m: None),
+    ("RSA", r"(?P<fam>RSA(?:SSA|ES)?(?:Encryption)?)(?:[-_ ]?(?:1024|2048|3072|4096|8192)(?!\d))?", lambda m: None),
     # Symmetric
     ("AES",
      r"(?P<fam>AES)(?:[-_ ]?(?:128|192|256)(?!\d))?"
      r"(?:[-_ ]?(?P<mode>GCM-SIV|GCM|CCM|CBC|CTR|ECB|XTS|KWP|KW|CFB(?:1|8|128)?|OFB|CMAC|GMAC|FF1|FF3-1))?",
      lambda m: m["mode"].upper() if m["mode"] else None),
+    ("3DES", r"(?P<fam>3DES|TDES|TDEA|Triple[-_ ]?DES)", lambda m: None),
+    ("ChaCha20", r"(?P<fam>ChaCha20)", lambda m: None),
+    ("MD5", r"(?P<fam>MD5)", lambda m: None),
 ]
 
 _COMPILED = [(fam, re.compile(_LB + rx + _LA, re.IGNORECASE), fn) for fam, rx, fn in _CATALOGUE]
 
 PQ_FAMILIES = {"ML-KEM", "ML-DSA", "SLH-DSA"}
-CLASSICAL_FAMILIES = {"RSA", "ECDSA", "ECDH", "EdDSA", "X25519", "X448", "DH", "AES",
-                      "SHA-1", "SHA-2", "SHA-3", "SHAKE", "HMAC"}
+CLASSICAL_FAMILIES = {"RSA", "DSA", "ECDSA", "ECDH", "EdDSA", "X25519", "X448", "DH", "AES",
+                      "3DES", "ChaCha20", "SHA-1", "SHA-2", "SHA-3", "SHAKE", "MD5", "HMAC"}
 
 
 def _slh_variant(m: re.Match) -> Optional[str]:
@@ -164,7 +171,7 @@ def expected_nist_level(tok: AlgToken) -> Optional[int]:
 # Heuristics for CBOM_ASSETTYPE_IMPLAUSIBLE
 # --------------------------------------------------------------------------
 IMPLEMENTATION_WORDS = re.compile(
-    r"\b(HSMs?|modules?|cards?|smart\s*cards?|appliances?|engines?|devices?|chips?|TPMs?)\b",
+    r"\b(HSMs?|modules?(?![-\s]lattice)|cards?|smart\s*cards?|appliances?|engines?|devices?|chips?|TPMs?)\b",
     re.IGNORECASE)
 KNOWN_PROTOCOLS = re.compile(
     r"\b(D?TLS|SSL|RFC\s*3161|time[-\s]?stamp(?:ing)?\s+protocol|IKE(?:v[12])?|IPsec|SSH(?:v?2)?"
@@ -216,6 +223,15 @@ def algorithm_text(c: dict) -> str:
     cp = crypto_props(c) or {}
     psi = (cp.get("algorithmProperties") or {}).get("parameterSetIdentifier")
     return f"{c.get('name', '')} {psi or ''}".strip()
+
+
+def algorithm_tokens_of(c: dict) -> list[AlgToken]:
+    """Algorithm names from name + parameterSetIdentifier. When the same family
+    appears both bare and complete (name 'ML-KEM', parameterSetIdentifier
+    'ML-KEM-768'), the bare one is dropped."""
+    toks = extract_algorithms(algorithm_text(c))
+    complete = {t.family for t in toks if _incomplete_name(t) is None}
+    return [t for t in toks if t.family not in complete or _incomplete_name(t) is None]
 
 
 def find_keys(obj: Any, key: str, path: str = "") -> Iterator[tuple[str, Any]]:
@@ -300,14 +316,13 @@ def check_components(bom: dict) -> list[Finding]:
                     "key material."))
             continue
 
-        alg_text = algorithm_text(c)
-        tokens = extract_algorithms(alg_text)
-        algorithm_tokens.extend(extract_algorithms(c.get("name", "")))
+        tokens = algorithm_tokens_of(c)
+        algorithm_tokens.extend(tokens)
         ap = cp.get("algorithmProperties") or {}
 
         # 4. declared level vs parameter set
         declared = ap.get("nistQuantumSecurityLevel")
-        if isinstance(declared, int):
+        if isinstance(declared, int) and not isinstance(declared, bool):
             for tok in tokens:
                 exp = expected_nist_level(tok)
                 if exp is not None and exp != declared:
@@ -328,7 +343,8 @@ def check_components(bom: dict) -> list[Finding]:
         found = ", ".join(sorted(families)) or "none recognised"
         out.append(Finding(
             "CBOM_NO_CLASSICAL_ALGORITHMS", ERROR, "components",
-            "No classical algorithm (RSA, ECDSA, ECDH, Ed25519, X25519, DH, AES, SHA-1/2/3, HMAC) "
+            "No classical algorithm (RSA, DSA, ECDSA, ECDH, Ed25519, X25519, DH, AES, 3DES, ChaCha20, "
+            "SHA-1/2/3, MD5, HMAC) "
             f"is listed (found: {found}). The purpose of a migration inventory is to show what "
             "is quantum-vulnerable today; listing only post-quantum algorithms describes the "
             "target state, not the inventory."))
@@ -373,16 +389,19 @@ def check_baseline(bom: dict, base: dict) -> list[Finding]:
     if _components_fingerprint(bom) == _components_fingerprint(base):
         return []
     out = []
-    if bom.get("serialNumber") == base.get("serialNumber"):
+    sn = bom.get("serialNumber")
+    if sn == base.get("serialNumber"):
         out.append(Finding(
             "CBOM_SERIALNUMBER_NOT_REFRESHED", ERROR, "serialNumber",
-            f"Components differ from the baseline but serialNumber is unchanged "
-            f"({bom.get('serialNumber')!r}). A changed BOM must get a new serialNumber."))
+            "Components differ from the baseline but serialNumber is "
+            + (f"unchanged ({sn!r})." if sn else "missing in both.")
+            + " A changed BOM must get a new serialNumber."))
     ts, bts = (bom.get("metadata") or {}).get("timestamp"), (base.get("metadata") or {}).get("timestamp")
     if ts == bts:
         out.append(Finding(
             "CBOM_TIMESTAMP_NOT_REFRESHED", ERROR, "metadata.timestamp",
-            f"Components differ from the baseline but metadata.timestamp is unchanged ({ts!r})."))
+            "Components differ from the baseline but metadata.timestamp is "
+            + (f"unchanged ({ts!r})." if ts else "missing in both.")))
     return out
 
 
@@ -433,14 +452,22 @@ def extract_from_report(report: Any) -> tuple[list[Extracted], str]:
 def _same_algorithm(a: AlgToken, b: AlgToken) -> bool:
     if a.family != b.family:
         return False
-    return a.variant is None or b.variant is None or a.variant == b.variant
+    if a.variant is None or b.variant is None or a.variant == b.variant:
+        return True
+    if a.family == "SLH-DSA":
+        # A part left out on one side ('SLH-DSA-128s' has no hash family) still
+        # matches, and is reported as ALGORITHM_NAME_MISMATCH instead.
+        ga, gb = a.groups, b.groups
+        return ga["size"] == gb["size"] and all(
+            not ga[k] or not gb[k] or ga[k].lower() == gb[k].lower() for k in ("hash", "sf"))
+    return False
 
 
 def check_acvp(bom: dict, report: Any) -> tuple[list[Finding], list[Extracted], str]:
     cbom: list[tuple[str, AlgToken]] = []
     for path, c in iter_components(bom):
         if asset_type(c) == "algorithm":
-            for t in extract_algorithms(c.get("name", "")):
+            for t in algorithm_tokens_of(c):
                 cbom.append((label(path, c), t))
     rep, strategy = extract_from_report(report)
     out: list[Finding] = []
@@ -452,13 +479,18 @@ def check_acvp(bom: dict, report: Any) -> tuple[list[Finding], list[Extracted], 
                 "CBOM_ALGORITHM_NOT_TESTED", ERROR, loc,
                 f"'{t.text}' is in the CBOM but no matching algorithm was found in the ACVP report."))
             continue
-        spellings = {r.token.spelling for r in matches}
-        if t.spelling.lower() not in {s.lower() for s in spellings}:
+        exact = [r for r in matches
+                 if r.token.spelling.lower() == t.spelling.lower()
+                 and (r.token.variant is None or t.variant is None or r.token.variant == t.variant)]
+        if not exact:
             srcs = "; ".join(sorted({f"'{r.token.text}' at {r.field}" for r in matches}))
+            partial = any(r.token.variant and t.variant and r.token.variant != t.variant for r in matches)
+            why = ("The report name leaves out part of the parameter set, so it does not say "
+                   "which variant was tested." if partial else
+                   "Same algorithm, different name; tools that match by string will miss it.")
             out.append(Finding(
                 "ALGORITHM_NAME_MISMATCH", ERROR, loc,
-                f"CBOM spells it '{t.text}', the ACVP report spells it differently: {srcs}. "
-                "Same algorithm, different name; tools that match by string will miss it."))
+                f"CBOM spells it '{t.text}', the ACVP report spells it differently: {srcs}. {why}"))
 
     seen = set()
     for r in rep:
@@ -479,7 +511,7 @@ def check_acvp(bom: dict, report: Any) -> tuple[list[Finding], list[Extracted], 
 
 def load_json(path: str, what: str) -> Any:
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError) as e:
         print(f"INPUT_ERROR: cannot read {what} '{path}': {e}", file=sys.stderr)
@@ -513,7 +545,10 @@ def run(argv: Optional[list[str]] = None) -> int:
 
     if args.baseline:
         base = load_json(args.baseline, "baseline")
-        findings += check_baseline(bom, base if isinstance(base, dict) else {})
+        if not isinstance(base, dict):
+            print("INPUT_ERROR: baseline top level is not a JSON object", file=sys.stderr)
+            return 2
+        findings += check_baseline(bom, base)
 
     extracted: list[Extracted] = []
     strategy = None

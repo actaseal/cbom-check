@@ -123,3 +123,79 @@ def test_acvp_extraction_ignores_sibling_fields_under_algorithm_list():
     }]}
     hits, _ = cbom_check.extract_from_report(report)
     assert [(h.token.text, h.field) for h in hits] == [("ML-KEM-1024", "algorithms[0].algorithm")]
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("SHA256withRSA", ["SHA-2:SHA2-256", "RSA"]),
+    ("sha256WithRSAEncryption", ["SHA-2:SHA2-256", "RSA"]),
+    ("ECDSAwithSHA256", ["ECDSA", "SHA-2:SHA2-256"]),
+    ("X25519MLKEM768", ["X25519", "ML-KEM:768"]),
+    ("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", ["ECDH", "RSA", "AES:GCM", "SHA-2:SHA2-256"]),
+    ("HMAC-SHA2-256", ["HMAC:SHA2-256"]),
+    ("ACVP-AES-GCM", ["AES:GCM"]),
+    ("Module-Lattice-Based KEM", []),
+    ("XML-KEM", []),
+])
+def test_real_world_name_forms(name, expected):
+    assert [t.ident for t in cbom_check.extract_algorithms(name)] == expected
+
+
+def _bom(*components):
+    bom = json.loads((FIX / "clean.json").read_text())
+    bom["components"] = list(components)
+    return bom
+
+
+def _alg(name, level=None, psi=None, description=None):
+    ap = {"primitive": "kem"}
+    if psi:
+        ap["parameterSetIdentifier"] = psi
+    if level is not None:
+        ap["nistQuantumSecurityLevel"] = level
+    c = {"type": "cryptographic-asset", "name": name,
+         "cryptoProperties": {"assetType": "algorithm", "algorithmProperties": ap}}
+    if description:
+        c["description"] = description
+    return c
+
+
+def test_parameter_set_from_identifier_is_not_incomplete():
+    bom = _bom(_alg("RSA-2048"), _alg("ML-KEM", 3, psi="ML-KEM-768"), _alg("ML-KEM", 5, psi="1024"))
+    assert cbom_check.check_components(bom) == []
+
+
+def test_parameter_set_from_identifier_feeds_level_check():
+    bom = _bom(_alg("RSA-2048"), _alg("ML-KEM", 5, psi="768"))
+    assert [f.code for f in cbom_check.check_components(bom)] == ["CBOM_NIST_LEVEL_MISMATCH"]
+
+
+def test_fips_title_in_description_is_not_an_implementation_word():
+    bom = _bom(_alg("RSA-2048"),
+               _alg("ML-KEM-768", 3, description="Module-Lattice-Based Key-Encapsulation Mechanism"))
+    assert cbom_check.check_components(bom) == []
+
+
+def test_hybrid_group_counts_as_classical():
+    bom = _bom(_alg("X25519MLKEM768", 3))
+    assert cbom_check.check_components(bom) == []
+
+
+def test_slh_dsa_without_hash_family_in_report_is_one_name_mismatch():
+    bom = _bom(_alg("RSA-2048"), _alg("SLH-DSA-SHAKE-128s", 1))
+    report = {"results": [{"algorithm": "RSA"}, {"algorithm": "SLH-DSA-128s"}]}
+    findings, _, _ = cbom_check.check_acvp(bom, report)
+    assert [f.code for f in findings] == ["ALGORITHM_NAME_MISMATCH"]
+
+
+def test_slh_dsa_different_hash_family_is_not_the_same_algorithm():
+    bom = _bom(_alg("RSA-2048"), _alg("SLH-DSA-SHAKE-128s", 1))
+    report = {"results": [{"algorithm": "RSA"}, {"algorithm": "SLH-DSA-SHA2-128s"}]}
+    findings, _, _ = cbom_check.check_acvp(bom, report)
+    assert sorted(f.code for f in findings) == ["ACVP_ALGORITHM_NOT_IN_CBOM", "CBOM_ALGORITHM_NOT_TESTED"]
+
+
+def test_utf8_bom_file_is_read(tmp_path):
+    p = tmp_path / "bom.json"
+    p.write_bytes(b"\xef\xbb\xbf" + (FIX / "clean.json").read_bytes())
+    rc, doc = run(p)
+    assert rc == 0 and doc["findings"] == []
