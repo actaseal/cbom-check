@@ -1,0 +1,2 @@
+jsonschema[format-nongpl]>=4.25,<5
+cyclonedx-python-lib[json-validation]>=8,<12

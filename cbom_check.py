@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""cbom_check: semantic checks for CycloneDX CBOMs.
+
+Schema validation answers "is this well-formed CycloneDX 1.6?".
+This tool answers "does what the CBOM *says* make sense?".
+A CBOM can pass the schema and still be wrong; that gap is the point of this tool.
+
+Usage:
+    python cbom_check.py <cbom.json> [--acvp <report.json>]
+                         [--baseline <previous_cbom.json>] [--strict] [--json]
+
+Exit codes:
+    0  no errors (warnings allowed unless --strict)
+    1  at least one error (with --strict, warnings count as errors)
+    2  input could not be read / parsed
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterator, Optional
+
+SCHEMA_NOTE = (
+    "Schema validation passing does NOT mean the CBOM is semantically correct. "
+    "The schema checks shape; the checks below check meaning."
+)
+
+ERROR = "error"
+WARNING = "warning"
+
+
+@dataclass
+class Finding:
+    code: str
+    severity: str
+    location: str
+    message: str
+    promoted_by_strict: bool = False
+
+
+# --------------------------------------------------------------------------
+# Algorithm name catalogue
+# --------------------------------------------------------------------------
+# Each entry: (family, regex, variant_fn). The regex must define a `fam` group:
+# the part of the name that is compared for spelling (ALGORITHM_NAME_MISMATCH).
+# Matching is case-insensitive; separators '-', '_', ' ' or none are accepted.
+
+_S = r"[-_ ]?"
+_LB = r"(?<![A-Za-z0-9])"
+_LA = r"(?![A-Za-z0-9])"
+
+
+def _hash_id(kind: Optional[str], size: str, trunc: Optional[str] = None) -> str:
+    if size == "1":
+        return "SHA-1"
+    if kind == "3":
+        return f"SHA3-{size}"
+    return f"SHA2-{size}" + (trunc or "")
+
+
+_CATALOGUE: list[tuple[str, str, Any]] = [
+    # Post-quantum (FIPS 203 / 204 / 205)
+    ("SLH-DSA",
+     rf"(?P<fam>SLH{_S}DSA)(?:{_S}(?P<hash>SHA2|SHAKE))?(?:{_S}(?P<size>128|192|256)(?P<sf>[sf])?)?",
+     lambda m: _slh_variant(m)),
+    ("ML-KEM", rf"(?P<fam>ML{_S}KEM)(?:{_S}(?P<p>512|768|1024)(?!\d))?", lambda m: m["p"]),
+    ("ML-DSA", rf"(?P<fam>ML{_S}DSA)(?:{_S}(?P<p>44|65|87)(?!\d))?", lambda m: m["p"]),
+    # MACs / hashes
+    ("HMAC",
+     rf"(?P<fam>HMAC{_S}SHA(?:{_S}(?P<k>[23])(?={_S}\d{{3}}))?{_S})(?P<size>1|224|256|384|512)(?!\d)",
+     lambda m: _hash_id(m["k"], m["size"])),
+    ("HMAC", r"(?P<fam>HMAC)", lambda m: None),
+    ("SHAKE", rf"(?P<fam>SHAKE{_S})(?P<size>128|256)(?!\d)", lambda m: f"SHAKE{m['size']}"),
+    ("SHA-1", rf"(?P<fam>SHA{_S})(?P<size>1)(?!\d)", lambda m: "SHA-1"),
+    ("SHA-3", rf"(?P<fam>SHA{_S}3{_S})(?P<size>224|256|384|512)(?!\d)", lambda m: _hash_id("3", m["size"])),
+    ("SHA-2",
+     rf"(?P<fam>SHA{_S}(?:2{_S})?)(?P<size>224|256|384|512)(?P<trunc>/(?:224|256))?(?!\d)",
+     lambda m: _hash_id("2", m["size"], m["trunc"])),
+    ("SHA-2", rf"(?P<fam>SHA{_S}2)(?!\d)", lambda m: None),
+    ("SHA-3", rf"(?P<fam>SHA{_S}3)(?!\d)", lambda m: None),
+    # Classical public key
+    ("EdDSA", r"(?P<fam>Ed25519|Ed448|EdDSA)", lambda m: None),
+    ("X25519", r"(?P<fam>X25519)", lambda m: None),
+    ("X448", r"(?P<fam>X448)", lambda m: None),
+    ("ECDSA", r"(?P<fam>ECDSA)", lambda m: None),
+    ("ECDH", r"(?P<fam>ECDHE?|KAS-ECC(?:-SSC)?)", lambda m: None),
+    ("DH", r"(?P<fam>FFDHE?|DHE?|Diffie[-_ ]?Hellman|KAS-FFC(?:-SSC)?)", lambda m: None),
+    ("RSA", r"(?P<fam>RSA(?:SSA|ES)?)(?:[-_ ]?(?:1024|2048|3072|4096|8192)(?!\d))?", lambda m: None),
+    # Symmetric
+    ("AES",
+     r"(?P<fam>AES)(?:[-_ ]?(?:128|192|256)(?!\d))?"
+     r"(?:[-_ ]?(?P<mode>GCM-SIV|GCM|CCM|CBC|CTR|ECB|XTS|KWP|KW|CFB(?:1|8|128)?|OFB|CMAC|GMAC|FF1|FF3-1))?",
+     lambda m: m["mode"].upper() if m["mode"] else None),
+]
+
+_COMPILED = [(fam, re.compile(_LB + rx + _LA, re.IGNORECASE), fn) for fam, rx, fn in _CATALOGUE]
+
+PQ_FAMILIES = {"ML-KEM", "ML-DSA", "SLH-DSA"}
+CLASSICAL_FAMILIES = {"RSA", "ECDSA", "ECDH", "EdDSA", "X25519", "X448", "DH", "AES",
+                      "SHA-1", "SHA-2", "SHA-3", "SHAKE", "HMAC"}
+
+
+def _slh_variant(m: re.Match) -> Optional[str]:
+    if not m["size"]:
+        return None
+    h = (m["hash"] or "?").upper()
+    return f"{h}-{m['size']}{(m['sf'] or '?').lower()}"
+
+
+@dataclass
+class AlgToken:
+    family: str
+    variant: Optional[str]
+    spelling: str          # the `fam` part, as written
+    text: str              # full matched text, as written
+    groups: dict = field(default_factory=dict)
+
+    @property
+    def ident(self) -> str:
+        return f"{self.family}:{self.variant}" if self.variant else self.family
+
+
+def extract_algorithms(text: str) -> list[AlgToken]:
+    """Find known algorithm names in free text. Earlier catalogue entries win;
+    a matched span is consumed so 'HMAC-SHA2-256' does not also yield 'SHA2-256'."""
+    taken: list[tuple[int, int]] = []
+    found: list[tuple[int, AlgToken]] = []
+    for family, rx, fn in _COMPILED:
+        for m in rx.finditer(text):
+            s, e = m.span()
+            if any(s < te and ts < e for ts, te in taken):
+                continue
+            taken.append((s, e))
+            found.append((s, AlgToken(family, fn(m), m["fam"], m.group(0), m.groupdict())))
+    return [t for _, t in sorted(found, key=lambda x: x[0])]
+
+
+# --------------------------------------------------------------------------
+# NIST PQC security categories.
+# Sources:
+#   FIPS 203 (ML-KEM), Table 2:  ML-KEM-512 -> 1, ML-KEM-768 -> 3, ML-KEM-1024 -> 5
+#   FIPS 204 (ML-DSA), Table 1:  ML-DSA-44 -> 2, ML-DSA-65 -> 3, ML-DSA-87 -> 5
+#   FIPS 205 (SLH-DSA), Table 2: SLH-DSA-{SHA2,SHAKE}-128{s,f} -> 1,
+#                                -192{s,f} -> 3, -256{s,f} -> 5
+# --------------------------------------------------------------------------
+NIST_LEVELS = {
+    ("ML-KEM", "512"): 1, ("ML-KEM", "768"): 3, ("ML-KEM", "1024"): 5,
+    ("ML-DSA", "44"): 2, ("ML-DSA", "65"): 3, ("ML-DSA", "87"): 5,
+}
+SLH_DSA_LEVELS = {"128": 1, "192": 3, "256": 5}
+
+
+def expected_nist_level(tok: AlgToken) -> Optional[int]:
+    if tok.family == "SLH-DSA":
+        return SLH_DSA_LEVELS.get(tok.groups.get("size") or "")
+    return NIST_LEVELS.get((tok.family, tok.variant or ""))
+
+
+# --------------------------------------------------------------------------
+# Heuristics for CBOM_ASSETTYPE_IMPLAUSIBLE
+# --------------------------------------------------------------------------
+IMPLEMENTATION_WORDS = re.compile(
+    r"\b(HSMs?|modules?|cards?|smart\s*cards?|appliances?|engines?|devices?|chips?|TPMs?)\b",
+    re.IGNORECASE)
+KNOWN_PROTOCOLS = re.compile(
+    r"\b(D?TLS|SSL|RFC\s*3161|time[-\s]?stamp(?:ing)?\s+protocol|IKE(?:v[12])?|IPsec|SSH(?:v?2)?"
+    r"|X\.?509\s+(?:certificate\s+|certification\s+)?path\s+validation)",
+    re.IGNORECASE)
+
+MODELLING_NOTE = ("This is a heuristic: the modelling decision is yours. "
+                  "The tool only raises the question.")
+
+
+# --------------------------------------------------------------------------
+# CBOM traversal helpers
+# --------------------------------------------------------------------------
+
+def iter_components(bom: dict) -> Iterator[tuple[str, dict]]:
+    def walk(comps: Any, prefix: str) -> Iterator[tuple[str, dict]]:
+        if not isinstance(comps, list):
+            return
+        for i, c in enumerate(comps):
+            if not isinstance(c, dict):
+                continue
+            path = f"{prefix}[{i}]"
+            yield path, c
+            yield from walk(c.get("components"), f"{path}.components")
+    yield from walk(bom.get("components"), "components")
+    meta_comp = (bom.get("metadata") or {}).get("component")
+    if isinstance(meta_comp, dict):
+        yield from walk(meta_comp.get("components"), "metadata.component.components")
+
+
+def label(path: str, c: dict) -> str:
+    name = c.get("name", "?")
+    ref = c.get("bom-ref")
+    return f"{path} '{name}'" + (f" (bom-ref {ref})" if ref and ref != name else "")
+
+
+def crypto_props(c: dict) -> Optional[dict]:
+    cp = c.get("cryptoProperties")
+    return cp if isinstance(cp, dict) else None
+
+
+def asset_type(c: dict) -> Optional[str]:
+    cp = crypto_props(c)
+    return cp.get("assetType") if cp else None
+
+
+def algorithm_text(c: dict) -> str:
+    """Name plus parameterSetIdentifier, e.g. 'ML-KEM' + '768'."""
+    cp = crypto_props(c) or {}
+    psi = (cp.get("algorithmProperties") or {}).get("parameterSetIdentifier")
+    return f"{c.get('name', '')} {psi or ''}".strip()
+
+
+def find_keys(obj: Any, key: str, path: str = "") -> Iterator[tuple[str, Any]]:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{path}.{k}" if path else k
+            if k == key:
+                yield p, v
+            yield from find_keys(v, key, p)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from find_keys(v, key, f"{path}[{i}]")
+
+
+# --------------------------------------------------------------------------
+# Schema validation (baseline, not the point of this tool)
+# --------------------------------------------------------------------------
+
+def schema_validate(bom: dict) -> tuple[bool, list[str]]:
+    from cyclonedx.schema import SchemaVersion
+    from cyclonedx.validation.json import JsonStrictValidator
+
+    errors = JsonStrictValidator(SchemaVersion.V1_6).validate_str(json.dumps(bom), all_errors=True)
+    if errors is None:
+        return True, []
+    msgs = []
+    for e in errors:
+        d = getattr(e, "data", None)
+        where = getattr(d, "json_path", "$")
+        msgs.append(f"{where}: {getattr(d, 'message', str(e))}")
+    return False, msgs
+
+
+# --------------------------------------------------------------------------
+# Semantic checks
+# --------------------------------------------------------------------------
+
+def check_components(bom: dict) -> list[Finding]:
+    out: list[Finding] = []
+    algorithm_tokens: list[AlgToken] = []
+
+    for path, c in iter_components(bom):
+        loc = label(path, c)
+        cp = crypto_props(c)
+        at = asset_type(c)
+        text = f"{c.get('name', '')} {c.get('description', '')}"
+
+        # 1. cryptographic-asset without cryptoProperties
+        if c.get("type") == "cryptographic-asset" and cp is None:
+            out.append(Finding(
+                "CBOM_ASSET_MISSING_CRYPTO_PROPERTIES", ERROR, loc,
+                "Component type is 'cryptographic-asset' but it has no cryptoProperties; "
+                "nothing about the asset (algorithm, protocol, certificate, key) is recorded."))
+
+        if cp is None:
+            continue
+
+        # 2. assetType plausibility (heuristic -> warning)
+        if at == "algorithm":
+            hit = IMPLEMENTATION_WORDS.search(text)
+            if hit:
+                out.append(Finding(
+                    "CBOM_ASSETTYPE_IMPLAUSIBLE", WARNING, loc,
+                    f"assetType is 'algorithm' but name/description mentions '{hit.group(0)}', "
+                    "which usually describes an implementation (HSM, module, device...), not an "
+                    f"algorithm. {MODELLING_NOTE}"))
+        elif at == "protocol":
+            if not KNOWN_PROTOCOLS.search(text):
+                out.append(Finding(
+                    "CBOM_ASSETTYPE_IMPLAUSIBLE", WARNING, loc,
+                    "assetType is 'protocol' but name/description does not match a recognised "
+                    "protocol (TLS, RFC 3161, IKE, SSH, IPsec, X.509 path validation). "
+                    f"{MODELLING_NOTE}"))
+
+        # 3. nistQuantumSecurityLevel on non-algorithm
+        if at != "algorithm":
+            for kpath, _ in find_keys(cp, "nistQuantumSecurityLevel", "cryptoProperties"):
+                out.append(Finding(
+                    "CBOM_NIST_LEVEL_ON_NON_ALGORITHM", ERROR, loc,
+                    f"{kpath} is set but assetType is '{at}'. NIST security categories are "
+                    "properties of algorithm parameter sets, not of protocols, certificates or "
+                    "key material."))
+            continue
+
+        alg_text = algorithm_text(c)
+        tokens = extract_algorithms(alg_text)
+        algorithm_tokens.extend(extract_algorithms(c.get("name", "")))
+        ap = cp.get("algorithmProperties") or {}
+
+        # 4. declared level vs parameter set
+        declared = ap.get("nistQuantumSecurityLevel")
+        if isinstance(declared, int):
+            for tok in tokens:
+                exp = expected_nist_level(tok)
+                if exp is not None and exp != declared:
+                    out.append(Finding(
+                        "CBOM_NIST_LEVEL_MISMATCH", ERROR, loc,
+                        f"'{tok.text}' is NIST security category {exp} "
+                        f"({_fips_for(tok.family)}), but nistQuantumSecurityLevel is {declared}."))
+
+        # 5. incomplete parameter-set names
+        for tok in tokens:
+            msg = _incomplete_name(tok)
+            if msg:
+                out.append(Finding("CBOM_PARAMETER_SET_NAME_INCOMPLETE", ERROR, loc, msg))
+
+    # 6. no classical algorithm at all
+    families = {t.family for t in algorithm_tokens}
+    if not families & CLASSICAL_FAMILIES:
+        found = ", ".join(sorted(families)) or "none recognised"
+        out.append(Finding(
+            "CBOM_NO_CLASSICAL_ALGORITHMS", ERROR, "components",
+            "No classical algorithm (RSA, ECDSA, ECDH, Ed25519, X25519, DH, AES, SHA-1/2/3, HMAC) "
+            f"is listed (found: {found}). The purpose of a migration inventory is to show what "
+            "is quantum-vulnerable today; listing only post-quantum algorithms describes the "
+            "target state, not the inventory."))
+    return out
+
+
+def _fips_for(family: str) -> str:
+    return {"ML-KEM": "FIPS 203", "ML-DSA": "FIPS 204", "SLH-DSA": "FIPS 205"}.get(family, "")
+
+
+def _incomplete_name(tok: AlgToken) -> Optional[str]:
+    g = tok.groups
+    if tok.family == "SLH-DSA":
+        if not g.get("size"):
+            return (f"'{tok.text}' has no parameter set. FIPS 205 names are "
+                    "SLH-DSA-{SHA2|SHAKE}-{128|192|256}{s|f}, e.g. SLH-DSA-SHA2-128s.")
+        if not g.get("hash"):
+            sz = f"{g['size']}{(g.get('sf') or 's').lower()}"
+            return (f"'{tok.text}' is missing the hash family. FIPS 205 defines both "
+                    f"SLH-DSA-SHA2-{sz} and SLH-DSA-SHAKE-{sz}; they are different algorithms.")
+        if not g.get("sf"):
+            return (f"'{tok.text}' is missing the 's' (small) / 'f' (fast) suffix required by "
+                    f"FIPS 205, e.g. SLH-DSA-{g['hash'].upper()}-{g['size']}s.")
+    elif tok.family == "ML-KEM" and not tok.variant:
+        return f"'{tok.text}' has no parameter set. FIPS 203 names are ML-KEM-512, ML-KEM-768, ML-KEM-1024."
+    elif tok.family == "ML-DSA" and not tok.variant:
+        return f"'{tok.text}' has no parameter set. FIPS 204 names are ML-DSA-44, ML-DSA-65, ML-DSA-87."
+    elif tok.family == "SHA-2" and not tok.variant:
+        return (f"'{tok.text}' names a family, not an algorithm. FIPS 180-4 names are "
+                "SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, SHA-512/256.")
+    elif tok.family == "SHA-3" and not tok.variant:
+        return (f"'{tok.text}' names a family, not an algorithm. FIPS 202 names are "
+                "SHA3-224, SHA3-256, SHA3-384, SHA3-512.")
+    return None
+
+
+def _components_fingerprint(bom: dict) -> list[str]:
+    return sorted(json.dumps(c, sort_keys=True) for _, c in iter_components(bom))
+
+
+def check_baseline(bom: dict, base: dict) -> list[Finding]:
+    if _components_fingerprint(bom) == _components_fingerprint(base):
+        return []
+    out = []
+    if bom.get("serialNumber") == base.get("serialNumber"):
+        out.append(Finding(
+            "CBOM_SERIALNUMBER_NOT_REFRESHED", ERROR, "serialNumber",
+            f"Components differ from the baseline but serialNumber is unchanged "
+            f"({bom.get('serialNumber')!r}). A changed BOM must get a new serialNumber."))
+    ts, bts = (bom.get("metadata") or {}).get("timestamp"), (base.get("metadata") or {}).get("timestamp")
+    if ts == bts:
+        out.append(Finding(
+            "CBOM_TIMESTAMP_NOT_REFRESHED", ERROR, "metadata.timestamp",
+            f"Components differ from the baseline but metadata.timestamp is unchanged ({ts!r})."))
+    return out
+
+
+# --------------------------------------------------------------------------
+# ACVP cross-check
+# --------------------------------------------------------------------------
+
+@dataclass
+class Extracted:
+    token: AlgToken
+    field: str
+    raw: str
+
+
+def extract_from_report(report: Any) -> tuple[list[Extracted], str]:
+    """Report formats are vendor-specific, so walk every string value and key.
+    If any match sits under a field whose name contains 'alg' (algorithm, algo,
+    hashAlg, ...), only those are used; otherwise every match is used."""
+    hits: list[Extracted] = []
+
+    def walk(o: Any, path: str) -> None:
+        if isinstance(o, dict):
+            for k, v in o.items():
+                p = f"{path}.{k}" if path else k
+                for t in extract_algorithms(str(k)):
+                    hits.append(Extracted(t, f"{p} (key)", str(k)))
+                walk(v, p)
+        elif isinstance(o, list):
+            for i, v in enumerate(o):
+                walk(v, f"{path}[{i}]")
+        elif isinstance(o, str):
+            for t in extract_algorithms(o):
+                hits.append(Extracted(t, path, o))
+
+    walk(report, "")
+    alg_hits = [h for h in hits if re.search(r"alg", h.field.replace(" (key)", ""), re.IGNORECASE)]
+    if alg_hits:
+        return alg_hits, "fields whose path contains 'alg'"
+    return hits, "all string values and keys (no 'alg'-named field found)"
+
+
+def _same_algorithm(a: AlgToken, b: AlgToken) -> bool:
+    if a.family != b.family:
+        return False
+    return a.variant is None or b.variant is None or a.variant == b.variant
+
+
+def check_acvp(bom: dict, report: Any) -> tuple[list[Finding], list[Extracted], str]:
+    cbom: list[tuple[str, AlgToken]] = []
+    for path, c in iter_components(bom):
+        if asset_type(c) == "algorithm":
+            for t in extract_algorithms(c.get("name", "")):
+                cbom.append((label(path, c), t))
+    rep, strategy = extract_from_report(report)
+    out: list[Finding] = []
+
+    for loc, t in cbom:
+        matches = [r for r in rep if _same_algorithm(t, r.token)]
+        if not matches:
+            out.append(Finding(
+                "CBOM_ALGORITHM_NOT_TESTED", ERROR, loc,
+                f"'{t.text}' is in the CBOM but no matching algorithm was found in the ACVP report."))
+            continue
+        spellings = {r.token.spelling for r in matches}
+        if t.spelling.lower() not in {s.lower() for s in spellings}:
+            srcs = "; ".join(sorted({f"'{r.token.text}' at {r.field}" for r in matches}))
+            out.append(Finding(
+                "ALGORITHM_NAME_MISMATCH", ERROR, loc,
+                f"CBOM spells it '{t.text}', the ACVP report spells it differently: {srcs}. "
+                "Same algorithm, different name; tools that match by string will miss it."))
+
+    seen = set()
+    for r in rep:
+        key = (r.token.ident, r.token.text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        if not any(_same_algorithm(r.token, t) for _, t in cbom):
+            out.append(Finding(
+                "ACVP_ALGORITHM_NOT_IN_CBOM", ERROR, f"report {r.field}",
+                f"'{r.token.text}' is in the ACVP report but not in the CBOM inventory."))
+    return out, rep, strategy
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def load_json(path: str, what: str) -> Any:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"INPUT_ERROR: cannot read {what} '{path}': {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def run(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Semantic checks for CycloneDX CBOMs.")
+    ap.add_argument("cbom")
+    ap.add_argument("--acvp", help="ACVP / CAVP test report (JSON, any vendor format)")
+    ap.add_argument("--baseline", help="previous CBOM, to check serialNumber/timestamp refresh")
+    ap.add_argument("--strict", action="store_true", help="treat warnings as errors")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args(argv)
+
+    bom = load_json(args.cbom, "CBOM")
+    if not isinstance(bom, dict):
+        print("INPUT_ERROR: CBOM top level is not a JSON object", file=sys.stderr)
+        return 2
+
+    findings: list[Finding] = []
+    schema_ok, schema_errors = schema_validate(bom)
+    if not schema_ok:
+        shown = schema_errors[:10]
+        more = f" (+{len(schema_errors) - 10} more)" if len(schema_errors) > 10 else ""
+        findings.append(Finding(
+            "CBOM_SCHEMA_INVALID", ERROR, "$",
+            "Not valid CycloneDX 1.6: " + " | ".join(shown) + more))
+
+    findings += check_components(bom)
+
+    if args.baseline:
+        base = load_json(args.baseline, "baseline")
+        findings += check_baseline(bom, base if isinstance(base, dict) else {})
+
+    extracted: list[Extracted] = []
+    strategy = None
+    if args.acvp:
+        report = load_json(args.acvp, "ACVP report")
+        acvp_findings, extracted, strategy = check_acvp(bom, report)
+        findings += acvp_findings
+
+    if args.strict:
+        for f in findings:
+            if f.severity == WARNING:
+                f.severity, f.promoted_by_strict = ERROR, True
+
+    n_err = sum(f.severity == ERROR for f in findings)
+    n_warn = sum(f.severity == WARNING for f in findings)
+    exit_code = 1 if n_err else 0
+
+    if args.json:
+        doc = {
+            "cbom": args.cbom,
+            "schema": {"version": "1.6", "valid": schema_ok, "errors": schema_errors,
+                       "note": SCHEMA_NOTE},
+            "findings": [asdict(f) for f in findings],
+            "summary": {"errors": n_err, "warnings": n_warn, "strict": args.strict,
+                        "exit_code": exit_code},
+        }
+        if args.acvp:
+            doc["acvp_extraction"] = {
+                "report": args.acvp, "strategy": strategy,
+                "algorithms": [{"name": e.token.text, "raw_value": e.raw, "field": e.field}
+                           for e in extracted]}
+        print(json.dumps(doc, indent=2))
+        return exit_code
+
+    print(f"cbom_check: {args.cbom}")
+    print(f"  Schema (CycloneDX 1.6): {'PASS' if schema_ok else 'FAIL'}")
+    print(f"  NOTE: {SCHEMA_NOTE}")
+    if args.acvp:
+        print(f"  ACVP report: {args.acvp} -- algorithm names taken from {strategy}:")
+        for e in extracted:
+            raw = "" if e.raw == e.token.text else f" (in {e.raw!r})"
+            print(f"    - {e.token.text!r}{raw} from {e.field}")
+    print()
+    if not findings:
+        print("  No semantic findings.")
+    for f in findings:
+        tag = f.severity.upper() + (" (strict)" if f.promoted_by_strict else "")
+        print(f"  [{tag}] {f.code}")
+        print(f"      at:  {f.location}")
+        print(f"      why: {f.message}")
+    print()
+    print(f"  {n_err} error(s), {n_warn} warning(s)"
+          f"{' [--strict: warnings are errors]' if args.strict else ''} -> exit {exit_code}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(run())
