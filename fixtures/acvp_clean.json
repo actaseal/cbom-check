@@ -1,0 +1,54 @@
+{
+  "vendorName": "ACME RSA Labs",
+  "product": "payments-gateway crypto library",
+  "testSessions": [
+    {
+      "id": 4711,
+      "status": "passed",
+      "vectorSets": [
+        {
+          "algorithm": "RSA",
+          "mode": "sigGen",
+          "revision": "FIPS186-5"
+        },
+        {
+          "algorithm": "ECDH",
+          "mode": "ssc",
+          "revision": "Sp800-56Ar3"
+        },
+        {
+          "algorithm": "ACVP-AES-GCM",
+          "revision": "1.0"
+        },
+        {
+          "algorithm": "SHA-256",
+          "revision": "1.0"
+        },
+        {
+          "algorithm": "ML-KEM",
+          "mode": "encapDecap",
+          "revision": "FIPS203",
+          "parameterSets": [
+            "ML-KEM-768"
+          ]
+        },
+        {
+          "algorithm": "ML-DSA",
+          "mode": "sigGen",
+          "revision": "FIPS204",
+          "parameterSets": [
+            "ML-DSA-65"
+          ]
+        },
+        {
+          "algorithm": "SLH-DSA",
+          "mode": "sigGen",
+          "revision": "FIPS205",
+          "parameterSets": [
+            "SLH-DSA-SHA2-128s"
+          ]
+        }
+      ]
+    }
+  ]
+}
