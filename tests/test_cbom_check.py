@@ -111,3 +111,15 @@ def test_unreadable_input_exits_two():
                           capture_output=True, text=True)
     assert proc.returncode == 2
     assert "INPUT_ERROR" in proc.stderr
+
+
+def test_acvp_extraction_ignores_sibling_fields_under_algorithm_list():
+    # Regression: a parent path containing 'alg' must not pull in sibling fields,
+    # or 'AES-256 equivalent' in a security-level label reads as "AES was tested".
+    report = {"algorithms": [{
+        "algorithm": "ML-KEM-1024",
+        "securityLevel": "NIST Level 5 (AES-256 equivalent)",
+        "testTypes": [{"name": "SHA-256 KeyGen vectors"}],
+    }]}
+    hits, _ = cbom_check.extract_from_report(report)
+    assert [(h.token.text, h.field) for h in hits] == [("ML-KEM-1024", "algorithms[0].algorithm")]

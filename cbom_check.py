@@ -399,8 +399,10 @@ class Extracted:
 
 def extract_from_report(report: Any) -> tuple[list[Extracted], str]:
     """Report formats are vendor-specific, so walk every string value and key.
-    If any match sits under a field whose name contains 'alg' (algorithm, algo,
-    hashAlg, ...), only those are used; otherwise every match is used."""
+    If any match comes from a field whose own name contains 'alg' (algorithm,
+    algo, hashAlg, ...), only those are used; otherwise every match is used.
+    Only the field's own name counts, not its parents: under 'algorithms[0]',
+    a 'securityLevel' of 'AES-192 equivalent' is not an algorithm."""
     hits: list[Extracted] = []
 
     def walk(o: Any, path: str) -> None:
@@ -418,9 +420,13 @@ def extract_from_report(report: Any) -> tuple[list[Extracted], str]:
                 hits.append(Extracted(t, path, o))
 
     walk(report, "")
-    alg_hits = [h for h in hits if re.search(r"alg", h.field.replace(" (key)", ""), re.IGNORECASE)]
+
+    def leaf(f: str) -> str:
+        return re.sub(r"\[\d+\]", "", f.replace(" (key)", "")).rsplit(".", 1)[-1]
+
+    alg_hits = [h for h in hits if "alg" in leaf(h.field).lower()]
     if alg_hits:
-        return alg_hits, "fields whose path contains 'alg'"
+        return alg_hits, "fields whose name contains 'alg'"
     return hits, "all string values and keys (no 'alg'-named field found)"
 
 

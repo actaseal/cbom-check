@@ -73,8 +73,9 @@ fixtures/missing.json                          -> exit 2
 
 **ACVP reports** are vendor-specific, so the tool does not assume a format. It
 walks the whole JSON (values and keys) looking for known algorithm name patterns.
-If any match sits under a field whose path contains `alg` (`algorithm`, `algo`,
-`hashAlg`, ...), only those are used; otherwise every match is used. The output
+If any match comes from a field whose own name contains `alg` (`algorithm`, `algo`,
+`hashAlg`, ...), only those are used (parent names don't count, so a
+`securityLevel: "AES-192 equivalent"` under `algorithms[0]` is ignored); otherwise every match is used. The output
 lists every extracted name and the JSON field it came from, so you can see what
 was compared.
 
