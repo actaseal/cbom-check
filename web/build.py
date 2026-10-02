@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the static site for verify.actaseal.com into web/dist/.
+"""Build the static site for cbom.actaseal.com into web/dist/.
 
 Everything is self-hosted: Pyodide (Python compiled to WebAssembly), the
 wheels cbom_check needs, and cbom_check.py itself. The page makes no

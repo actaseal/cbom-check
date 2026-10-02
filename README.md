@@ -12,7 +12,8 @@ named reason code and a non-zero exit, so it can gate CI.
 
 ```
 pip install -r requirements.txt
-python cbom_check.py <cbom.json> [--acvp <report.json>] [--baseline <previous_cbom.json>] [--strict] [--json]
+python cbom_check.py <cbom.json> [--acvp <report.json>] [--baseline <previous_cbom.json>]
+                     [--profile cert-in] [--inventory] [--strict] [--json]
 ```
 
 Example:
@@ -58,7 +59,7 @@ fixtures/missing.json                          -> exit 2
 
 | Reason code | Severity | Check |
 |---|---|---|
-| `CBOM_SCHEMA_INVALID` | error | Baseline only: CycloneDX 1.6 JSON schema (via `jsonschema` and the schema bundled in `cyclonedx-python-lib`). Passing this says nothing about the checks below. |
+| `CBOM_SCHEMA_INVALID` | error | Baseline only: CycloneDX 1.6 or 1.7 JSON schema, chosen by the BOM's `specVersion` (via `jsonschema` and the schema bundled in `cyclonedx-python-lib`). Passing this says nothing about the checks below. |
 | `CBOM_ASSET_MISSING_CRYPTO_PROPERTIES` | error | Component `type` is `cryptographic-asset` but has no `cryptoProperties`. |
 | `CBOM_ASSETTYPE_IMPLAUSIBLE` | warning (error with `--strict`) | Name/description mentions HSM, module, card, appliance, engine, device, chip, TPM and `assetType` is `algorithm`; or `assetType` is `protocol` but name/description does not match a real protocol (TLS, RFC 3161, IKE, SSH, IPsec, X.509 path validation). The modelling decision is yours; the tool only raises the question. |
 | `CBOM_NIST_LEVEL_ON_NON_ALGORITHM` | error | `nistQuantumSecurityLevel` on a component whose `assetType` is not `algorithm`. |
@@ -70,6 +71,20 @@ fixtures/missing.json                          -> exit 2
 | `ACVP_ALGORITHM_NOT_IN_CBOM` | error | With `--acvp`: algorithm in the test report, not in the CBOM. |
 | `CBOM_ALGORITHM_NOT_TESTED` | error | With `--acvp`: algorithm in the CBOM, not in the test report. |
 | `ALGORITHM_NAME_MISMATCH` | error | With `--acvp`: same algorithm in both, spelled differently (e.g. `SHA-256` vs `SHA2-256`, `ECDH` vs `KAS-ECC`). Case is ignored. |
+| `CBOM_CERTIN_ELEMENT_MISSING` | error | With `--profile cert-in`: an asset lacks a CERT-In CBOM minimum element. Algorithms: primitive, crypto functions, classical security level, OID, and mode for block ciphers / AE. Keys: ID, size, creation and activation date. Certificates: subject, issuer, validity, signature algorithm reference, format, extension. |
+
+The element list for `--profile cert-in` follows CERT-In's *Technical Guidelines on SBOM, QBOM & CBOM, AIBOM and HBOM* v2.0 as summarised in published guides; check it against the official PDF before relying on it for a submission.
+
+### Inventory
+
+Every run also returns an inventory (`--inventory` prints it; `--json` and the web page always include it): one row per crypto asset with its quantum status:
+- `vulnerable`: RSA, DSA, ECDSA, ECDH, EdDSA, X25519/X448 or DH, all broken by Shor's algorithm.
+- `quantum-resistant`: ML-KEM, ML-DSA, SLH-DSA, LMS or XMSS.
+- `hybrid`: both kinds in one asset.
+- `symmetric/hash`: not broken by Shor.
+- `unknown`: no algorithm recognised.
+
+Certificates, keys and protocols take their status from the algorithm components they reference (e.g. `signatureAlgorithmRef`).
 
 **ACVP reports** are vendor-specific, so the tool does not assume a format. It
 walks the whole JSON (values and keys) looking for known algorithm name patterns.
@@ -91,6 +106,20 @@ was compared.
 ## Limitation
 
 `CBOM_ASSETTYPE_IMPLAUSIBLE` is a keyword heuristic and can be wrong; all other checks are deterministic.
+
+## CI gate (GitHub Action)
+
+```yaml
+- uses: actaseal/cbom-check@v1   # or @main
+  with:
+    cbom: build/cbom.json
+    acvp: reports/acvp.json        # optional
+    baseline: previous/cbom.json   # optional
+    profile: cert-in               # optional
+    strict: "true"                 # optional
+```
+
+The job fails whenever the checker reports an error. Its log shows the findings and the inventory.
 
 ## Web version
 

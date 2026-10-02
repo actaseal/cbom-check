@@ -21,7 +21,7 @@ def _load(text, what, must_be_object):
         raise ValueError(f"{what} top level is not a JSON object")
     return value
 
-def web_check(cbom, acvp, baseline, strict):
+def web_check(cbom, acvp, baseline, strict, certin):
     # Absent optional files arrive as a JS null, which is not None in Python.
     acvp = acvp if isinstance(acvp, str) else None
     baseline = baseline if isinstance(baseline, str) else None
@@ -31,7 +31,8 @@ def web_check(cbom, acvp, baseline, strict):
         base = _load(baseline, "baseline", True) if baseline is not None else None
     except ValueError as e:
         return json.dumps({"input_error": str(e), "summary": {"exit_code": 2}})
-    return json.dumps(cbom_check.check(bom, report, base, strict))
+    profile = "cert-in" if certin else None
+    return json.dumps(cbom_check.check(bom, report, base, strict, profile))
 `;
 
 async function boot() {
@@ -92,7 +93,8 @@ function bindDrop(kind) {
 
 function run() {
   const fn = py.globals.get("web_check");
-  const out = fn(files.cbom.text, files.acvp?.text, files.baseline?.text, $("strict").checked);
+  const out = fn(files.cbom.text, files.acvp?.text, files.baseline?.text, $("strict").checked,
+    $("certin").checked);
   fn.destroy();
   lastResult = JSON.parse(out);
   render(lastResult);
@@ -124,10 +126,11 @@ function render(r) {
   box.append(el("div", { class: `verdict ${code ? "fail" : "pass"}` },
     el("strong", {}, code ? "FAIL" : "PASS"),
     el("span", {}, `exit ${code} · ${s.errors} error(s), ${s.warnings} warning(s)` +
-      (s.strict ? " · strict: warnings count as errors" : ""))));
+      (s.strict ? " · strict: warnings count as errors" : "") +
+      (s.profile === "cert-in" ? " · CERT-In profile" : ""))));
 
   box.append(el("div", { class: `schema ${r.schema.valid ? "ok" : "bad"}` },
-    el("div", {}, el("strong", {}, "CycloneDX 1.6 schema: "), r.schema.valid ? "PASS" : "FAIL"),
+    el("div", {}, el("strong", {}, `CycloneDX ${r.schema.version ?? "?"} schema: `), r.schema.valid ? "PASS" : "FAIL"),
     el("p", { class: "note" }, r.schema.note)));
 
   if (r.acvp_extraction) {
@@ -158,6 +161,29 @@ function render(r) {
       el("p", {}, f.message)));
   }
   box.append(list);
+
+  if (r.inventory && r.inventory.length) {
+    const counts = {};
+    for (const row of r.inventory) counts[row.quantum] = (counts[row.quantum] || 0) + 1;
+    const tbody = el("tbody");
+    for (const row of r.inventory) {
+      tbody.append(el("tr", {},
+        el("td", {}, el("span", { class: `q q-${row.quantum.replace(/[^a-z]/g, "")}` }, row.quantum)),
+        el("td", {}, row.name),
+        el("td", {}, row.asset_type || "?"),
+        el("td", {}, (row.algorithms.join(", ") || "–") + (row.via.length ? ` (via ${row.via.join(", ")})` : "")),
+        el("td", {}, row.parameter_set_or_size == null ? "" : String(row.parameter_set_or_size))));
+    }
+    const summary = Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(" · ");
+    box.append(el("details", { class: "extract", open: "" },
+      el("summary", {}, `Inventory: ${summary}`),
+      el("p", { class: "hint" }, "Vulnerable = broken by a quantum computer running Shor's algorithm (RSA, ECC, DH). " +
+        "Certificates, keys and protocols take their algorithms from the components they reference."),
+      el("div", { class: "table-wrap" }, el("table", {},
+        el("thead", {}, el("tr", {}, el("th", {}, "Quantum"), el("th", {}, "Asset"), el("th", {}, "Type"),
+          el("th", {}, "Algorithms"), el("th", {}, "Param set / size"))),
+        tbody))));
+  }
   box.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 

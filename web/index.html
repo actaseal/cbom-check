@@ -49,6 +49,17 @@ label.strict { display: flex; gap: 8px; align-items: center; }
 #engine { color: var(--muted); font-size: 0.875rem; margin: 0 0 8px; }
 #engine[data-state="error"] { color: var(--fail); }
 .samples { color: var(--muted); font-size: 0.875rem; }
+header.brand { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; font-size: 0.9375rem; }
+header.brand a { color: var(--text); font-weight: 700; text-decoration: none; letter-spacing: 0.01em; }
+header.brand a.gh { color: var(--accent); font-weight: 500; }
+.hint { color: var(--muted); font-size: 0.875rem; margin: 8px 0 0; }
+.q { font-size: 0.75rem; font-weight: 700; padding: 2px 6px; border-radius: 4px; white-space: nowrap; }
+.q-vulnerable { background: var(--fail-bg); color: var(--fail); }
+.q-hybrid { background: var(--warn-bg); color: var(--warn); }
+.q-quantumresistant { background: var(--pass-bg); color: var(--pass); }
+.q-symmetrichash, .q-unknown { background: var(--code-bg); color: var(--muted); }
+.cta { margin-top: 32px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.cta a { color: var(--accent); font-weight: 600; }
 #results { margin-top: 32px; display: grid; gap: 12px; }
 .verdict { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; padding: 14px 16px; border-radius: 8px; }
 .verdict strong { font-size: 1.25rem; }
@@ -81,8 +92,10 @@ section.about code { color: var(--text); }
 </head>
 <body>
 <main>
+  <header class="brand"><a href="https://actaseal.com">ActaSeal</a>
+    <a class="gh" href="https://github.com/actaseal/cbom-check">Source &amp; CLI</a></header>
   <h1>CBOM Check</h1>
-  <p class="lede">Semantic checks for CycloneDX 1.6 Cryptography Bills of Materials.</p>
+  <p class="lede">Semantic checks for CycloneDX 1.6 and 1.7 Cryptography Bills of Materials.</p>
   <div class="claim"><strong>Passing the schema does not mean a CBOM is correct.</strong>
     This checks what the CBOM <em>says</em>: NIST levels against FIPS 203/204/205, asset modelling,
     incomplete parameter-set names, missing classical algorithms, refresh against a previous version,
@@ -111,6 +124,7 @@ section.about code { color: var(--text); }
   <div class="controls">
     <button class="primary" id="run" disabled>Check</button>
     <label class="strict"><input type="checkbox" id="strict"> Strict (warnings count as errors)</label>
+    <label class="strict"><input type="checkbox" id="certin"> CERT-In minimum elements</label>
     <button class="link" id="dl" hidden>Download JSON result</button>
   </div>
   <p class="samples">Try a sample:
@@ -120,16 +134,21 @@ section.about code { color: var(--text); }
 
   <div id="results" hidden></div>
 
+  <div class="cta">Reviewing CBOMs from many vendors, or need proof that a CBOM passed and when?
+    ActaSeal seals the result so your auditor can verify it offline.
+    <a href="https://actaseal.com">Talk to us →</a></div>
+
   <section class="about">
     <h2>Checks</h2>
     <ul>
-      <li><code>CBOM_SCHEMA_INVALID</code>: baseline CycloneDX 1.6 schema validation</li>
+      <li><code>CBOM_SCHEMA_INVALID</code>: baseline CycloneDX 1.6 / 1.7 schema validation</li>
       <li><code>CBOM_ASSET_MISSING_CRYPTO_PROPERTIES</code></li>
       <li><code>CBOM_ASSETTYPE_IMPLAUSIBLE</code>: heuristic, warning only; the modelling decision is yours</li>
       <li><code>CBOM_NIST_LEVEL_ON_NON_ALGORITHM</code>, <code>CBOM_NIST_LEVEL_MISMATCH</code></li>
       <li><code>CBOM_PARAMETER_SET_NAME_INCOMPLETE</code>, <code>CBOM_NO_CLASSICAL_ALGORITHMS</code></li>
       <li><code>CBOM_SERIALNUMBER_NOT_REFRESHED</code>, <code>CBOM_TIMESTAMP_NOT_REFRESHED</code></li>
       <li><code>ACVP_ALGORITHM_NOT_IN_CBOM</code>, <code>CBOM_ALGORITHM_NOT_TESTED</code>, <code>ALGORITHM_NAME_MISMATCH</code></li>
+      <li><code>CBOM_CERTIN_ELEMENT_MISSING</code>: optional; CERT-In CBOM minimum elements (Technical Guidelines v2.0)</li>
     </ul>
     <h2>Limits</h2>
     <p>The assetType check is a heuristic; every other check is deterministic. It does not check
