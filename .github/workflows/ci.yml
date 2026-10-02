@@ -32,3 +32,25 @@ jobs:
           path: web/.cache
           key: pyodide-${{ hashFiles('web/build.py') }}
       - run: python web/build.py
+
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clean CBOM passes through the action
+        uses: ./
+        with:
+          cbom: fixtures/certin_complete.json
+          acvp: fixtures/acvp_clean.json
+          baseline: fixtures/baseline.json
+          profile: cert-in
+          strict: "true"
+      - name: Broken CBOM fails the action
+        id: broken
+        continue-on-error: true
+        uses: ./
+        with:
+          cbom: fixtures/nist_level_mismatch.json
+      - name: Expect the broken CBOM to have failed
+        if: steps.broken.outcome != 'failure'
+        run: exit 1

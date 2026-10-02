@@ -41,6 +41,8 @@ BAD = [
     ("clean.json", ["--acvp", FIX / "acvp_algorithm_not_in_cbom.json"], "ACVP_ALGORITHM_NOT_IN_CBOM"),
     ("clean.json", ["--acvp", FIX / "acvp_cbom_algorithm_not_tested.json"], "CBOM_ALGORITHM_NOT_TESTED"),
     ("clean.json", ["--acvp", FIX / "acvp_algorithm_name_mismatch.json"], "ALGORITHM_NAME_MISMATCH"),
+    ("clean.json", ["--profile", "cert-in"], "CBOM_CERTIN_ELEMENT_MISSING"),
+    ("unsupported_spec_version.json", [], "CBOM_SCHEMA_INVALID"),
 ]
 
 
@@ -58,6 +60,7 @@ def test_every_reason_code_has_a_fixture():
         "CBOM_PARAMETER_SET_NAME_INCOMPLETE", "CBOM_NO_CLASSICAL_ALGORITHMS",
         "CBOM_SERIALNUMBER_NOT_REFRESHED", "CBOM_TIMESTAMP_NOT_REFRESHED",
         "ACVP_ALGORITHM_NOT_IN_CBOM", "CBOM_ALGORITHM_NOT_TESTED", "ALGORITHM_NAME_MISMATCH",
+        "CBOM_CERTIN_ELEMENT_MISSING",
     }
     assert {b[2] for b in BAD} == expected
 
@@ -199,3 +202,52 @@ def test_utf8_bom_file_is_read(tmp_path):
     p.write_bytes(b"\xef\xbb\xbf" + (FIX / "clean.json").read_bytes())
     rc, doc = run(p)
     assert rc == 0 and doc["findings"] == []
+
+
+def test_cyclonedx_1_7_cbom_validates_against_1_7():
+    rc, doc = run(FIX / "clean_v1_7.json", "--acvp", FIX / "acvp_clean.json", "--strict")
+    assert doc["schema"] == {**doc["schema"], "version": "1.7", "valid": True}
+    assert doc["findings"] == []
+    assert rc == 0
+
+
+def test_algorithm_family_does_not_cause_acvp_spelling_mismatch():
+    # 1.7 algorithmFamily 'RSASSA-PKCS1' is a category, not the vendor's name for it.
+    bom = json.loads((FIX / "clean_v1_7.json").read_text())
+    findings, _, _ = cbom_check.check_acvp(bom, {"a": [{"algorithm": "RSA"}]})
+    assert "ALGORITHM_NAME_MISMATCH" not in {f.code for f in findings}
+
+
+def test_certin_profile_passes_when_all_elements_present():
+    rc, doc = run(FIX / "certin_complete.json", "--profile", "cert-in", "--strict")
+    assert doc["findings"] == [] and rc == 0
+
+
+def test_certin_profile_is_opt_in():
+    rc, doc = run(FIX / "clean.json")
+    assert rc == 0 and doc["summary"]["profile"] is None
+
+
+def test_certin_profile_names_missing_elements():
+    _, doc = run(FIX / "clean.json", "--profile", "cert-in")
+    by_loc = {f["location"]: f["message"] for f in doc["findings"]}
+    aes = next(m for loc, m in by_loc.items() if "AES-256-GCM" in loc)
+    assert "OID" in aes and "classical security level" in aes and "mode" in aes
+    cert = next(m for loc, m in by_loc.items() if "server certificate" in loc)
+    assert "issuer name" in cert and "certificate format" in cert
+
+
+def test_inventory_marks_quantum_status_and_follows_references():
+    _, doc = run(FIX / "certin_complete.json")
+    inv = {r["name"]: r for r in doc["inventory"]}
+    assert inv["RSA-2048"]["quantum"] == "vulnerable"
+    assert inv["ML-KEM-768"]["quantum"] == "quantum-resistant"
+    assert inv["AES-256-GCM"]["quantum"] == "symmetric/hash"
+    assert inv["server certificate"]["quantum"] == "vulnerable"
+    assert inv["server certificate"]["via"] == ["RSA-2048"]
+    assert inv["server private key"]["parameter_set_or_size"] == 2048
+
+
+def test_inventory_hybrid_group():
+    bom = _bom(_alg("X25519MLKEM768", 3))
+    assert cbom_check.inventory(bom)[0]["quantum"] == "hybrid"

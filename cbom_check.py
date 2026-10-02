@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """cbom_check: semantic checks for CycloneDX CBOMs.
 
-Schema validation answers "is this well-formed CycloneDX 1.6?".
+Schema validation answers "is this well-formed CycloneDX 1.6/1.7?".
 This tool answers "does what the CBOM *says* make sense?".
 A CBOM can pass the schema and still be wrong; that gap is the point of this tool.
 
 Usage:
     python cbom_check.py <cbom.json> [--acvp <report.json>]
-                         [--baseline <previous_cbom.json>] [--strict] [--json]
+                         [--baseline <previous_cbom.json>] [--profile cert-in]
+                         [--inventory] [--strict] [--json]
 
 Exit codes:
     0  no errors (warnings allowed unless --strict)
@@ -72,6 +73,9 @@ _CATALOGUE: list[tuple[str, str, Any]] = [
      lambda m: _slh_variant(m)),
     ("ML-KEM", rf"(?P<fam>ML{_S}KEM)(?:{_S}(?P<p>512|768|1024)(?!\d))?", lambda m: m["p"]),
     ("ML-DSA", rf"(?P<fam>ML{_S}DSA)(?:{_S}(?P<p>44|65|87)(?!\d))?", lambda m: m["p"]),
+    # Stateful hash-based signatures (NIST SP 800-208)
+    ("LMS", r"(?P<fam>LMS|HSS)", lambda m: None),
+    ("XMSS", r"(?P<fam>XMSS(?:MT|\^MT)?)", lambda m: None),
     # MACs / hashes
     ("HMAC",
      rf"(?P<fam>HMAC{_S}SHA(?:{_S}(?P<k>[23])(?={_S}\d{{3}}))?{_S})(?P<size>1|224|256|384|512)(?!\d)",
@@ -106,7 +110,7 @@ _CATALOGUE: list[tuple[str, str, Any]] = [
 
 _COMPILED = [(fam, re.compile(_LB + rx + _LA, re.IGNORECASE), fn) for fam, rx, fn in _CATALOGUE]
 
-PQ_FAMILIES = {"ML-KEM", "ML-DSA", "SLH-DSA"}
+PQ_FAMILIES = {"ML-KEM", "ML-DSA", "SLH-DSA", "LMS", "XMSS"}
 CLASSICAL_FAMILIES = {"RSA", "DSA", "ECDSA", "ECDH", "EdDSA", "X25519", "X448", "DH", "AES",
                       "3DES", "ChaCha20", "SHA-1", "SHA-2", "SHA-3", "SHAKE", "MD5", "HMAC"}
 
@@ -218,18 +222,22 @@ def asset_type(c: dict) -> Optional[str]:
     return cp.get("assetType") if cp else None
 
 
-def algorithm_text(c: dict) -> str:
-    """Name plus parameterSetIdentifier, e.g. 'ML-KEM' + '768'."""
+def algorithm_text(c: dict, with_family: bool = True) -> str:
+    """Name, algorithmFamily (1.7) and parameterSetIdentifier, e.g.
+    'my-kem' + 'ML-KEM' + '768'. The family goes right before the parameter
+    set so the two read as one name."""
     cp = crypto_props(c) or {}
-    psi = (cp.get("algorithmProperties") or {}).get("parameterSetIdentifier")
-    return f"{c.get('name', '')} {psi or ''}".strip()
+    ap = cp.get("algorithmProperties") or {}
+    family = ap.get("algorithmFamily") if with_family else None
+    parts = [c.get("name", ""), family, ap.get("parameterSetIdentifier")]
+    return " ".join(str(p) for p in parts if p)
 
 
-def algorithm_tokens_of(c: dict) -> list[AlgToken]:
+def algorithm_tokens_of(c: dict, with_family: bool = True) -> list[AlgToken]:
     """Algorithm names from name + parameterSetIdentifier. When the same family
     appears both bare and complete (name 'ML-KEM', parameterSetIdentifier
     'ML-KEM-768'), the bare one is dropped."""
-    toks = extract_algorithms(algorithm_text(c))
+    toks = extract_algorithms(algorithm_text(c, with_family))
     complete = {t.family for t in toks if _incomplete_name(t) is None}
     return [t for t in toks if t.family not in complete or _incomplete_name(t) is None]
 
@@ -250,11 +258,21 @@ def find_keys(obj: Any, key: str, path: str = "") -> Iterator[tuple[str, Any]]:
 # Schema validation (baseline, not the point of this tool)
 # --------------------------------------------------------------------------
 
+SUPPORTED_SPEC_VERSIONS = ("1.6", "1.7")
+
+
 def schema_validate(bom: dict) -> tuple[bool, list[str]]:
+    """Validate against the schema of the BOM's own specVersion (1.6 or 1.7;
+    CBOM support starts at 1.6)."""
     from cyclonedx.schema import SchemaVersion
     from cyclonedx.validation.json import JsonStrictValidator
 
-    errors = JsonStrictValidator(SchemaVersion.V1_6).validate_str(json.dumps(bom), all_errors=True)
+    spec = bom.get("specVersion")
+    if spec not in SUPPORTED_SPEC_VERSIONS:
+        return False, [f"$.specVersion: {spec!r} is not supported; this tool validates "
+                       f"CycloneDX {' and '.join(SUPPORTED_SPEC_VERSIONS)}"]
+    version = SchemaVersion.V1_6 if spec == "1.6" else SchemaVersion.V1_7
+    errors = JsonStrictValidator(version).validate_str(json.dumps(bom), all_errors=True)
     if errors is None:
         return True, []
     msgs = []
@@ -467,7 +485,9 @@ def check_acvp(bom: dict, report: Any) -> tuple[list[Finding], list[Extracted], 
     cbom: list[tuple[str, AlgToken]] = []
     for path, c in iter_components(bom):
         if asset_type(c) == "algorithm":
-            for t in algorithm_tokens_of(c):
+            # The family field ('RSASSA-PKCS1') is a category, not the name
+            # the vendor uses, so it is left out of the spelling comparison.
+            for t in algorithm_tokens_of(c, with_family=False):
                 cbom.append((label(path, c), t))
     rep, strategy = extract_from_report(report)
     out: list[Finding] = []
@@ -506,6 +526,128 @@ def check_acvp(bom: dict, report: Any) -> tuple[list[Finding], list[Extracted], 
 
 
 # --------------------------------------------------------------------------
+# CERT-In profile (--profile cert-in)
+# --------------------------------------------------------------------------
+# Minimum CBOM elements from CERT-In "Technical Guidelines on SBOM, QBOM & CBOM,
+# AIBOM and HBOM" v2.0, mapped to CycloneDX fields. Elements that every
+# schema-valid component already has (name, assetType) are not repeated here.
+KEY_TYPES = {"private-key", "public-key", "secret-key", "key"}
+CERTIN_ALGORITHM = [("primitive", "algorithmProperties.primitive"),
+                    ("crypto functions", "algorithmProperties.cryptoFunctions"),
+                    ("classical security level", "algorithmProperties.classicalSecurityLevel"),
+                    ("OID", "oid")]
+CERTIN_KEY = [("key ID", "relatedCryptoMaterialProperties.id"),
+              ("key size", "relatedCryptoMaterialProperties.size"),
+              ("creation date", "relatedCryptoMaterialProperties.creationDate"),
+              ("activation date", "relatedCryptoMaterialProperties.activationDate")]
+CERTIN_CERTIFICATE = [("subject name", "certificateProperties.subjectName"),
+                      ("issuer name", "certificateProperties.issuerName"),
+                      ("validity start", "certificateProperties.notValidBefore"),
+                      ("validity end", "certificateProperties.notValidAfter"),
+                      ("signature algorithm reference", "certificateProperties.signatureAlgorithmRef"),
+                      ("certificate format", "certificateProperties.certificateFormat")]
+
+
+def _get(obj: dict, dotted: str) -> Any:
+    for part in dotted.split("."):
+        obj = obj.get(part) if isinstance(obj, dict) else None
+    return obj
+
+
+def check_certin(bom: dict) -> list[Finding]:
+    out = []
+    for path, c in iter_components(bom):
+        cp = crypto_props(c)
+        if cp is None:
+            continue
+        at = cp.get("assetType")
+        required: list[tuple[str, str]] = []
+        if at == "algorithm":
+            required = list(CERTIN_ALGORITHM)
+            if _get(cp, "algorithmProperties.primitive") in ("block-cipher", "ae"):
+                required.append(("mode", "algorithmProperties.mode"))
+        elif at == "related-crypto-material":
+            if _get(cp, "relatedCryptoMaterialProperties.type") in KEY_TYPES | {None}:
+                required = CERTIN_KEY
+        elif at == "certificate":
+            required = list(CERTIN_CERTIFICATE)
+        missing = [label_ for label_, field_ in required if _get(cp, field_) in (None, "", [])]
+        if at == "certificate" and not any(_get(cp, f"certificateProperties.{k}") for k in
+                                           ("certificateExtension", "certificateFileExtension",
+                                            "certificateExtensions")):
+            missing.append("certificate extension")
+        if missing:
+            out.append(Finding(
+                "CBOM_CERTIN_ELEMENT_MISSING", ERROR, label(path, c),
+                f"Missing CERT-In CBOM minimum element(s) for a{'n' if at[0] in 'aeiou' else ''} "
+                f"{at}: {', '.join(missing)}."))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Inventory: what is quantum-vulnerable today
+# --------------------------------------------------------------------------
+SHOR_VULNERABLE = {"RSA", "DSA", "ECDSA", "ECDH", "EdDSA", "X25519", "X448", "DH"}
+
+
+def _quantum_status(families: set[str]) -> str:
+    vulnerable = families & SHOR_VULNERABLE
+    pq = families & PQ_FAMILIES
+    if vulnerable and pq:
+        return "hybrid"
+    if vulnerable:
+        return "vulnerable"
+    if pq:
+        return "quantum-resistant"
+    if families:
+        return "symmetric/hash"
+    return "unknown"
+
+
+def _refs_in(obj: Any) -> Iterator[str]:
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _refs_in(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _refs_in(v)
+
+
+def inventory(bom: dict) -> list[dict]:
+    """One row per crypto asset. Certificates, keys and protocols take their
+    algorithms from the components their cryptoProperties reference."""
+    comps = list(iter_components(bom))
+    by_ref = {c["bom-ref"]: c for _, c in comps if isinstance(c.get("bom-ref"), str)}
+    rows = []
+    for path, c in comps:
+        cp = crypto_props(c)
+        if cp is None:
+            continue
+        at = cp.get("assetType")
+        if at == "algorithm":
+            toks = algorithm_tokens_of(c)
+            via: list[str] = []
+        else:
+            refs = [r for r in _refs_in(cp) if r in by_ref and r != c.get("bom-ref")]
+            toks = [t for r in refs for t in algorithm_tokens_of(by_ref[r])]
+            via = [by_ref[r].get("name", r) for r in refs]
+        ap = cp.get("algorithmProperties") or {}
+        size = ap.get("parameterSetIdentifier") or _get(cp, "relatedCryptoMaterialProperties.size")
+        rows.append({
+            "location": path,
+            "name": c.get("name", "?"),
+            "asset_type": at,
+            "algorithms": sorted({t.text for t in toks}),
+            "via": via,
+            "parameter_set_or_size": size,
+            "quantum": _quantum_status({t.family for t in toks}),
+        })
+    return rows
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -519,7 +661,7 @@ def load_json(path: str, what: str) -> Any:
 
 
 def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
-          strict: bool = False) -> dict:
+          strict: bool = False, profile: Optional[str] = None) -> dict:
     """Run every check and return the result document (what --json prints,
     minus file names). Shared by the CLI and the web page."""
     findings: list[Finding] = []
@@ -529,9 +671,12 @@ def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
         more = f" (+{len(schema_errors) - 10} more)" if len(schema_errors) > 10 else ""
         findings.append(Finding(
             "CBOM_SCHEMA_INVALID", ERROR, "$",
-            "Not valid CycloneDX 1.6: " + " | ".join(shown) + more))
+            f"Not valid CycloneDX {bom.get('specVersion')}: " + " | ".join(shown) + more))
 
     findings += check_components(bom)
+
+    if profile == "cert-in":
+        findings += check_certin(bom)
 
     if baseline is not None:
         findings += check_baseline(bom, baseline)
@@ -550,11 +695,12 @@ def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
     n_err = sum(f.severity == ERROR for f in findings)
     n_warn = sum(f.severity == WARNING for f in findings)
     doc = {
-        "schema": {"version": "1.6", "valid": schema_ok, "errors": schema_errors,
-                   "note": SCHEMA_NOTE},
+        "schema": {"version": bom.get("specVersion"), "valid": schema_ok,
+                   "errors": schema_errors, "note": SCHEMA_NOTE},
         "findings": [asdict(f) for f in findings],
+        "inventory": inventory(bom),
         "summary": {"errors": n_err, "warnings": n_warn, "strict": strict,
-                    "exit_code": 1 if n_err else 0},
+                    "profile": profile, "exit_code": 1 if n_err else 0},
     }
     if acvp is not None:
         doc["acvp_extraction"] = {
@@ -569,6 +715,10 @@ def run(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("cbom")
     ap.add_argument("--acvp", help="ACVP / CAVP test report (JSON, any vendor format)")
     ap.add_argument("--baseline", help="previous CBOM, to check serialNumber/timestamp refresh")
+    ap.add_argument("--profile", choices=["cert-in"],
+                    help="also require the CERT-In CBOM minimum elements")
+    ap.add_argument("--inventory", action="store_true",
+                    help="print the quantum-vulnerability inventory table")
     ap.add_argument("--strict", action="store_true", help="treat warnings as errors")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args(argv)
@@ -585,7 +735,7 @@ def run(argv: Optional[list[str]] = None) -> int:
             return 2
     report = load_json(args.acvp, "ACVP report") if args.acvp else None
 
-    doc = check(bom, report, base, args.strict)
+    doc = check(bom, report, base, args.strict, args.profile)
     exit_code = doc["summary"]["exit_code"]
 
     if args.json:
@@ -597,7 +747,8 @@ def run(argv: Optional[list[str]] = None) -> int:
 
     s = doc["summary"]
     print(f"cbom_check: {args.cbom}")
-    print(f"  Schema (CycloneDX 1.6): {'PASS' if doc['schema']['valid'] else 'FAIL'}")
+    print(f"  Schema (CycloneDX {doc['schema']['version']}): "
+          f"{'PASS' if doc['schema']['valid'] else 'FAIL'}")
     print(f"  NOTE: {SCHEMA_NOTE}")
     if args.acvp:
         ex = doc["acvp_extraction"]
@@ -613,6 +764,13 @@ def run(argv: Optional[list[str]] = None) -> int:
         print(f"  [{tag}] {f['code']}")
         print(f"      at:  {f['location']}")
         print(f"      why: {f['message']}")
+    if args.inventory:
+        print()
+        print("  Inventory (quantum status per crypto asset):")
+        for r in doc["inventory"]:
+            algs = ", ".join(r["algorithms"]) or "-"
+            via = f" via {', '.join(r['via'])}" if r["via"] else ""
+            print(f"    {r['quantum']:<17} {r['asset_type'] or '?':<24} {r['name']}  [{algs}]{via}")
     print()
     print(f"  {s['errors']} error(s), {s['warnings']} warning(s)"
           f"{' [--strict: warnings are errors]' if args.strict else ''} -> exit {exit_code}")
