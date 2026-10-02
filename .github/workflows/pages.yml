@@ -1,4 +1,4 @@
-name: Deploy verify site
+name: Deploy cbom.actaseal.com
 
 on:
   push:
