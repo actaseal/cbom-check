@@ -130,7 +130,7 @@ function render(r) {
       (s.profile === "cert-in" ? " · CERT-In profile" : ""))));
 
   box.append(el("div", { class: `schema ${r.schema.valid ? "ok" : "bad"}` },
-    el("div", {}, el("strong", {}, "CycloneDX 1.6 schema: "), r.schema.valid ? "PASS" : "FAIL"),
+    el("div", {}, el("strong", {}, `CycloneDX ${r.schema.version ?? "?"} schema: `), r.schema.valid ? "PASS" : "FAIL"),
     el("p", { class: "note" }, r.schema.note)));
 
   if (r.acvp_extraction) {
