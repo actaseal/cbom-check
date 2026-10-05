@@ -13,17 +13,11 @@ jobs:
   dns:
     runs-on: ubuntu-latest
     steps:
-      - name: DNS records
+      - name: DKIM selectors and www certificate
         run: |
-          for q in "actaseal.com MX" "actaseal.com TXT" "_dmarc.actaseal.com TXT" "default._domainkey.actaseal.com TXT" \
-                   "actaseal.com CAA" "verify.actaseal.com CNAME" "cbom.actaseal.com CNAME" "app.actaseal.com A" \
-                   "www.actaseal.com CNAME"; do
-            set -- $q
-            echo "== $1 $2"; dig +short "$1" "$2" || true
+          for s in zmail zoho zm1 zm2 selector1 selector2 mail dkim; do
+            r=$(dig +short TXT "$s._domainkey.actaseal.com"); [ -n "$r" ] && echo "DKIM $s: present (${#r} chars)" || echo "DKIM $s: none"
           done
-      - name: HTTPS status
-        run: |
-          for u in https://actaseal.com https://www.actaseal.com https://verify.actaseal.com https://verify.actaseal.com/browser/ \
-                   https://cbom.actaseal.com https://actaseal.com/.well-known/security.txt https://actaseal-verify.pages.dev/; do
-            echo "$u -> $(curl -sS -m 20 -o /dev/null -w '%{http_code} %{redirect_url}' "$u" || echo ERR)"
-          done
+          echo | openssl s_client -connect www.actaseal.com:443 -servername www.actaseal.com 2>/dev/null | openssl x509 -noout -subject -ext subjectAltName -dates || true
+          echo | openssl s_client -connect actaseal.com:443 -servername actaseal.com 2>/dev/null | openssl x509 -noout -subject -ext subjectAltName -dates || true
+          curl -sS -m 20 -o /dev/null -w 'http://www -> %{http_code} %{redirect_url}\n' http://www.actaseal.com/ || true
