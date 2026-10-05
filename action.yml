@@ -17,7 +17,7 @@ inputs:
     required: false
     default: ""
   profile:
-    description: Extra requirement profile, e.g. "cert-in" (optional)
+    description: 'Extra requirement profiles, comma-separated: cert-in, weak, cnsa2 (optional)'
     required: false
     default: ""
   strict:
@@ -44,6 +44,10 @@ runs:
         args=("$CBOM" --inventory)
         [ -n "$ACVP" ] && args+=(--acvp "$ACVP")
         [ -n "$BASELINE" ] && args+=(--baseline "$BASELINE")
-        [ -n "$PROFILE" ] && args+=(--profile "$PROFILE")
+        IFS=',' read -ra profiles <<< "$PROFILE"
+        for p in "${profiles[@]}"; do
+          p="${p//[[:space:]]/}"
+          [ -n "$p" ] && args+=(--profile "$p")
+        done
         [ "$STRICT" = "true" ] && args+=(--strict)
         python "$GITHUB_ACTION_PATH/cbom_check.py" "${args[@]}"

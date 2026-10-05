@@ -88,6 +88,17 @@ section.about { margin-top: 48px; border-top: 1px solid var(--line); padding-top
 section.about h2 { color: var(--text); font-size: 1.0625rem; margin: 20px 0 6px; }
 section.about ul { padding-left: 20px; margin: 6px 0; }
 section.about code { color: var(--text); }
+.drop.disabled { opacity: 0.45; }
+#bulk-note { color: var(--muted); font-size: 0.875rem; margin: 8px 0 0; }
+ul.diff { list-style: none; padding: 0; margin: 8px 0 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8125rem; }
+ul.diff .d-added { color: var(--pass); }
+ul.diff .d-removed { color: var(--fail); }
+ul.diff .d-changed { color: var(--warn); }
+details.file { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px; }
+details.file summary { cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.875rem; }
+.file-detail { display: grid; gap: 12px; margin-top: 12px; }
+#results, .file-detail { grid-template-columns: minmax(0, 1fr); }
+td.mono { word-break: break-all; }
 </style>
 </head>
 <body>
@@ -98,15 +109,16 @@ section.about code { color: var(--text); }
   <p class="lede">Semantic checks for CycloneDX 1.6 and 1.7 Cryptography Bills of Materials.</p>
   <div class="claim"><strong>Passing the schema does not mean a CBOM is correct.</strong>
     This checks what the CBOM <em>says</em>: NIST levels against FIPS 203/204/205, asset modelling,
-    incomplete parameter-set names, missing classical algorithms, refresh against a previous version,
-    and agreement with an ACVP test report.</div>
+    incomplete parameter-set names, missing classical algorithms, what changed since a previous version,
+    and agreement with an ACVP test report. Optional profiles add CERT-In minimum elements,
+    weak algorithms and CNSA 2.0.</div>
 
   <p id="engine">Loading Python engine (about 15&nbsp;MB, cached after the first visit)…</p>
 
   <div class="inputs">
     <label class="drop" id="drop-cbom">
-      <input type="file" accept=".json,application/json">
-      <span class="t">CBOM</span><span class="h">Required · CycloneDX JSON</span>
+      <input type="file" accept=".json,application/json" multiple>
+      <span class="t">CBOM</span><span class="h">Required · CycloneDX JSON · select several to check them in bulk</span>
       <span class="fname"></span><button class="clear" type="button">Remove</button>
     </label>
     <label class="drop" id="drop-acvp">
@@ -124,13 +136,18 @@ section.about code { color: var(--text); }
   <div class="controls">
     <button class="primary" id="run" disabled>Check</button>
     <label class="strict"><input type="checkbox" id="strict"> Strict (warnings count as errors)</label>
-    <label class="strict"><input type="checkbox" id="certin"> CERT-In minimum elements</label>
+    <label class="strict"><input type="checkbox" data-profile="cert-in"> CERT-In minimum elements</label>
+    <label class="strict"><input type="checkbox" data-profile="weak"> Weak algorithms (NIST SP 800-131A)</label>
+    <label class="strict"><input type="checkbox" data-profile="cnsa2"> CNSA 2.0</label>
     <button class="link" id="dl" hidden>Download JSON result</button>
   </div>
+  <p id="bulk-note" hidden>Bulk mode: each CBOM is checked on its own. The ACVP report and previous CBOM
+    apply to a single CBOM, so they are ignored here.</p>
   <p class="samples">Try a sample:
     <button class="link" data-sample="nist_level_mismatch.json">wrong NIST level</button> ·
     <button class="link" data-sample="no_classical_algorithms.json">PQ-only inventory</button> ·
-    <button class="link" data-sample="clean.json">clean CBOM</button></p>
+    <button class="link" data-sample="clean.json">clean CBOM</button> ·
+    <button class="link" data-sample="cnsa2_compliant.json">CNSA 2.0 CBOM</button></p>
 
   <div id="results" hidden></div>
 
@@ -149,11 +166,18 @@ section.about code { color: var(--text); }
       <li><code>CBOM_SERIALNUMBER_NOT_REFRESHED</code>, <code>CBOM_TIMESTAMP_NOT_REFRESHED</code></li>
       <li><code>ACVP_ALGORITHM_NOT_IN_CBOM</code>, <code>CBOM_ALGORITHM_NOT_TESTED</code>, <code>ALGORITHM_NAME_MISMATCH</code></li>
       <li><code>CBOM_CERTIN_ELEMENT_MISSING</code>: optional; CERT-In CBOM minimum elements (Technical Guidelines v2.0)</li>
+      <li><code>CBOM_WEAK_ALGORITHM</code>: optional; MD5, Triple DES, RSA below 2048 bits (errors), SHA-1 and DSA (warnings), per NIST SP 800-131A Rev. 2 and FIPS 186-5</li>
+      <li><code>CBOM_CNSA2_NOT_ALLOWED</code>, <code>CBOM_CNSA2_TRANSITIONAL</code>: optional; NSA CNSA 2.0 (AES-256, SHA-384/512, ML-KEM-1024, ML-DSA-87, LMS/XMSS; classical public-key algorithms only during the transition)</li>
     </ul>
     <h2>Limits</h2>
     <p>The assetType check is a heuristic; every other check is deterministic. It does not check
-      inventory completeness, key lengths, certificate contents, or whether an ACVP report is genuine.
-      Self-run test vectors are not CAVP validation.</p>
+      inventory completeness, certificate contents, or whether an ACVP report is genuine; key sizes are
+      only read from algorithm names and parameter-set identifiers. Self-run test vectors are not
+      CAVP validation.</p>
+    <h2>Reproducible results</h2>
+    <p>The downloaded result names the SHA-256 of every input file and the checker version, so anyone
+      can run the same files and get the same result. It is not a timestamp: for proof of when a CBOM
+      passed, ActaSeal seals the result.</p>
     <h2>Privacy</h2>
     <p>The checker is Python running in your browser (Pyodide). Your files are read locally and
       never sent anywhere. The same code runs as a CLI:

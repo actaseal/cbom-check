@@ -7,8 +7,11 @@ A CBOM can pass the schema and still be wrong; that gap is the point of this too
 
 Usage:
     python cbom_check.py <cbom.json> [--acvp <report.json>]
-                         [--baseline <previous_cbom.json>] [--profile cert-in]
+                         [--baseline <previous_cbom.json>]
+                         [--profile cert-in|weak|cnsa2 ...]
                          [--inventory] [--strict] [--json]
+    python cbom_check.py <cbom.json> <cbom.json> ... [--profile ...] [--strict] [--json]
+        (bulk: one line per file, exit code of the worst file)
 
 Exit codes:
     0  no errors (warnings allowed unless --strict)
@@ -19,11 +22,14 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterator, Optional
+
+__version__ = "1.1.0"
 
 SCHEMA_NOTE = (
     "Schema validation passing does NOT mean the CBOM is semantically correct. "
@@ -403,6 +409,33 @@ def _components_fingerprint(bom: dict) -> list[str]:
     return sorted(json.dumps(c, sort_keys=True) for _, c in iter_components(bom))
 
 
+def _component_key(c: dict) -> str:
+    ref = c.get("bom-ref")
+    return f"ref:{ref}" if isinstance(ref, str) and ref else f"name:{c.get('name', '?')}"
+
+
+def _component_label(c: dict) -> str:
+    name, ref = c.get("name", "?"), c.get("bom-ref")
+    return f"{name} ({ref})" if isinstance(ref, str) and ref and ref != name else name
+
+
+def baseline_diff(bom: dict, base: dict) -> dict:
+    """What changed since the baseline. Components are matched by bom-ref,
+    or by name when there is none."""
+    now = {_component_key(c): c for _, c in iter_components(bom)}
+    before = {_component_key(c): c for _, c in iter_components(base)}
+
+    def same(a: dict, b: dict) -> bool:
+        return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+    return {
+        "added": sorted(_component_label(now[k]) for k in now.keys() - before.keys()),
+        "removed": sorted(_component_label(before[k]) for k in before.keys() - now.keys()),
+        "changed": sorted(_component_label(now[k]) for k in now.keys() & before.keys()
+                          if not same(now[k], before[k])),
+    }
+
+
 def check_baseline(bom: dict, base: dict) -> list[Finding]:
     if _components_fingerprint(bom) == _components_fingerprint(base):
         return []
@@ -585,6 +618,90 @@ def check_certin(bom: dict) -> list[Finding]:
 
 
 # --------------------------------------------------------------------------
+# Policy profiles (--profile weak, --profile cnsa2)
+# --------------------------------------------------------------------------
+# These judge the algorithms the CBOM lists, not whether the CBOM is correct,
+# so they are opt-in. An algorithm whose size is not stated is only judged
+# where the profile rejects every size but one (AES under CNSA 2.0).
+
+PROFILES = ("cert-in", "weak", "cnsa2")
+PUBLIC_KEY_CLASSICAL = {"RSA", "DSA", "ECDSA", "ECDH", "EdDSA", "X25519", "X448", "DH"}
+
+
+def _size_in(tok: AlgToken) -> Optional[int]:
+    m = re.search(r"(?<!\d)(\d{3,5})(?!\d)", tok.text)
+    return int(m.group(1)) if m else None
+
+
+def _weak(tok: AlgToken) -> Optional[tuple[str, str]]:
+    """NIST SP 800-131A Rev. 2 and FIPS 186-5."""
+    if tok.family == "MD5":
+        return ERROR, "MD5 is not an approved hash function; collisions are practical."
+    if tok.family == "3DES":
+        return ERROR, "Triple DES encryption is disallowed after 2023 (NIST SP 800-131A Rev. 2)."
+    if tok.family == "RSA":
+        size = _size_in(tok)
+        if size is not None and size < 2048:
+            return ERROR, (f"RSA keys below 2048 bits are disallowed (NIST SP 800-131A Rev. 2); "
+                           f"this one is {size}.")
+    if tok.family == "SHA-1":
+        return WARNING, ("SHA-1 is disallowed for digital signature generation and NIST retires it "
+                         "completely by 31 December 2030.")
+    if tok.family == "DSA":
+        return WARNING, "FIPS 186-5 no longer approves DSA for generating signatures, only for verifying them."
+    return None
+
+
+CNSA2_ALLOWED = ("CNSA 2.0 allows AES-256, SHA-384/SHA-512, ML-KEM-1024, ML-DSA-87, "
+                 "and LMS/XMSS for software and firmware signing.")
+
+
+def _cnsa2(tok: AlgToken) -> Optional[tuple[str, str, str]]:
+    """NSA CNSA 2.0 (September 2022). Returns (code, severity, message)."""
+    f = tok.family
+    if f in ("LMS", "XMSS", "HMAC"):
+        return None
+    if f == "AES":
+        size = _size_in(tok)
+        if size == 256:
+            return None
+        why = f"AES-{size} is not allowed." if size else "The AES key size is not stated."
+        return "CBOM_CNSA2_NOT_ALLOWED", ERROR, f"{why} {CNSA2_ALLOWED}"
+    if f == "SHA-2":
+        if tok.variant in ("SHA2-384", "SHA2-512") or tok.variant is None:
+            return None
+        return "CBOM_CNSA2_NOT_ALLOWED", ERROR, f"Only SHA-384 and SHA-512 are allowed. {CNSA2_ALLOWED}"
+    if f == "ML-KEM" and tok.variant == "1024" or f == "ML-DSA" and tok.variant == "87":
+        return None
+    if f in ("ML-KEM", "ML-DSA"):
+        if tok.variant is None:
+            return None
+        return "CBOM_CNSA2_NOT_ALLOWED", ERROR, f"Only the level 5 parameter set is allowed. {CNSA2_ALLOWED}"
+    if f in PUBLIC_KEY_CLASSICAL:
+        return "CBOM_CNSA2_TRANSITIONAL", WARNING, (
+            "Allowed only during the transition to CNSA 2.0; NSA plans for National Security "
+            "Systems to finish the move by 2035, with earlier dates for many system types.")
+    return "CBOM_CNSA2_NOT_ALLOWED", ERROR, f"Not part of CNSA 2.0. {CNSA2_ALLOWED}"
+
+
+def check_policy(bom: dict, profile: str) -> list[Finding]:
+    out = []
+    for path, c in iter_components(bom):
+        if asset_type(c) != "algorithm":
+            continue
+        for tok in algorithm_tokens_of(c):
+            if profile == "weak":
+                hit = _weak(tok)
+                if hit:
+                    out.append(Finding("CBOM_WEAK_ALGORITHM", hit[0], label(path, c), f"'{tok.text}': {hit[1]}"))
+            elif profile == "cnsa2":
+                res = _cnsa2(tok)
+                if res:
+                    out.append(Finding(res[0], res[1], label(path, c), f"'{tok.text}': {res[2]}"))
+    return out
+
+
+# --------------------------------------------------------------------------
 # Inventory: what is quantum-vulnerable today
 # --------------------------------------------------------------------------
 SHOR_VULNERABLE = {"RSA", "DSA", "ECDSA", "ECDH", "EdDSA", "X25519", "X448", "DH"}
@@ -651,19 +768,36 @@ def inventory(bom: dict) -> list[dict]:
 # CLI
 # --------------------------------------------------------------------------
 
-def load_json(path: str, what: str) -> Any:
+class InputError(Exception):
+    pass
+
+
+def load_json(path: str, what: str) -> tuple[Any, str]:
+    """Parsed value and the sha256 of the file's exact bytes."""
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"INPUT_ERROR: cannot read {what} '{path}': {e}", file=sys.stderr)
-        sys.exit(2)
+        with open(path, "rb") as f:
+            raw = f.read()
+        return json.loads(raw.decode("utf-8-sig")), hashlib.sha256(raw).hexdigest()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise InputError(f"cannot read {what} '{path}': {e}") from e
+
+
+def _profiles(profile: Any) -> list[str]:
+    profiles = [profile] if isinstance(profile, str) else list(profile or [])
+    unknown = [p for p in profiles if p not in PROFILES]
+    if unknown:
+        raise ValueError(f"unknown profile(s) {unknown}; known: {', '.join(PROFILES)}")
+    return profiles
 
 
 def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
-          strict: bool = False, profile: Optional[str] = None) -> dict:
+          strict: bool = False, profile: Any = None,
+          input_hashes: Optional[dict] = None) -> dict:
     """Run every check and return the result document (what --json prints,
-    minus file names). Shared by the CLI and the web page."""
+    minus file names). Shared by the CLI and the web page. `profile` is one
+    profile name or a list of them; `input_hashes` maps cbom/acvp/baseline to
+    the sha256 of the exact input bytes, so the result names what it judged."""
+    profiles = _profiles(profile)
     findings: list[Finding] = []
     schema_ok, schema_errors = schema_validate(bom)
     if not schema_ok:
@@ -675,8 +809,8 @@ def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
 
     findings += check_components(bom)
 
-    if profile == "cert-in":
-        findings += check_certin(bom)
+    for p in profiles:
+        findings += check_certin(bom) if p == "cert-in" else check_policy(bom, p)
 
     if baseline is not None:
         findings += check_baseline(bom, baseline)
@@ -694,14 +828,22 @@ def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
 
     n_err = sum(f.severity == ERROR for f in findings)
     n_warn = sum(f.severity == WARNING for f in findings)
-    doc = {
+    doc: dict = {
+        "tool": {"name": "cbom-check", "version": __version__},
+    }
+    if input_hashes:
+        doc["inputs"] = {k: {"sha256": v} for k, v in input_hashes.items() if v}
+    doc.update({
         "schema": {"version": bom.get("specVersion"), "valid": schema_ok,
                    "errors": schema_errors, "note": SCHEMA_NOTE},
         "findings": [asdict(f) for f in findings],
         "inventory": inventory(bom),
         "summary": {"errors": n_err, "warnings": n_warn, "strict": strict,
-                    "profile": profile, "exit_code": 1 if n_err else 0},
-    }
+                    "profile": ",".join(profiles) or None, "profiles": profiles,
+                    "exit_code": 1 if n_err else 0},
+    })
+    if baseline is not None:
+        doc["baseline_diff"] = baseline_diff(bom, baseline)
     if acvp is not None:
         doc["acvp_extraction"] = {
             "strategy": strategy,
@@ -710,43 +852,99 @@ def check(bom: dict, acvp: Any = None, baseline: Optional[dict] = None,
     return doc
 
 
+def _load_cbom(path: str) -> tuple[dict, str]:
+    bom, digest = load_json(path, "CBOM")
+    if not isinstance(bom, dict):
+        raise InputError(f"CBOM '{path}' top level is not a JSON object")
+    return bom, digest
+
+
+def run_bulk(paths: list[str], strict: bool, profiles: list[str], as_json: bool) -> int:
+    results = []
+    for path in paths:
+        try:
+            bom, digest = _load_cbom(path)
+        except InputError as e:
+            results.append({"cbom": path, "input_error": str(e), "summary": {"exit_code": 2}})
+            continue
+        results.append({"cbom": path, **check(bom, strict=strict, profile=profiles,
+                                              input_hashes={"cbom": digest})})
+    unreadable = sum(r["summary"]["exit_code"] == 2 for r in results)
+    failed = sum(r["summary"]["exit_code"] == 1 for r in results)
+    exit_code = 2 if unreadable else (1 if failed else 0)
+    summary = {"files": len(results), "passed": len(results) - failed - unreadable,
+               "failed": failed, "unreadable": unreadable, "exit_code": exit_code}
+    if as_json:
+        print(json.dumps({"tool": {"name": "cbom-check", "version": __version__},
+                          "results": results, "summary": summary}, indent=2))
+        return exit_code
+    print(f"cbom_check (bulk): {len(results)} file(s)"
+          + (f", profile(s): {', '.join(profiles)}" if profiles else "")
+          + (" [--strict]" if strict else ""))
+    for r in results:
+        if "input_error" in r:
+            print(f"  ERROR  {r['cbom']}: {r['input_error']}")
+            continue
+        s = r["summary"]
+        verdict = "FAIL " if s["exit_code"] else "PASS "
+        codes = sorted({f["code"] for f in r["findings"] if f["severity"] == ERROR})
+        print(f"  {verdict} {s['errors']:>3} error(s) {s['warnings']:>3} warning(s)  {r['cbom']}"
+              + (f"  [{', '.join(codes)}]" if codes else ""))
+    print()
+    print(f"  {failed + unreadable} of {len(results)} file(s) failed -> exit {exit_code}")
+    return exit_code
+
+
 def run(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Semantic checks for CycloneDX CBOMs.")
-    ap.add_argument("cbom")
+    ap.add_argument("cbom", nargs="+", help="CBOM file; several files run in bulk mode")
     ap.add_argument("--acvp", help="ACVP / CAVP test report (JSON, any vendor format)")
     ap.add_argument("--baseline", help="previous CBOM, to check serialNumber/timestamp refresh")
-    ap.add_argument("--profile", choices=["cert-in"],
-                    help="also require the CERT-In CBOM minimum elements")
+    ap.add_argument("--profile", action="append", choices=PROFILES, default=[],
+                    help="extra requirements, repeatable: cert-in (CERT-In CBOM minimum "
+                         "elements), weak (NIST SP 800-131A disallowed/deprecated), "
+                         "cnsa2 (NSA CNSA 2.0)")
     ap.add_argument("--inventory", action="store_true",
                     help="print the quantum-vulnerability inventory table")
     ap.add_argument("--strict", action="store_true", help="treat warnings as errors")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args(argv)
 
-    bom = load_json(args.cbom, "CBOM")
-    if not isinstance(bom, dict):
-        print("INPUT_ERROR: CBOM top level is not a JSON object", file=sys.stderr)
-        return 2
-    base = None
-    if args.baseline:
-        base = load_json(args.baseline, "baseline")
-        if not isinstance(base, dict):
-            print("INPUT_ERROR: baseline top level is not a JSON object", file=sys.stderr)
+    if len(args.cbom) > 1:
+        if args.acvp or args.baseline:
+            print("INPUT_ERROR: --acvp and --baseline belong to one CBOM; "
+                  "run them per file, not in bulk mode", file=sys.stderr)
             return 2
-    report = load_json(args.acvp, "ACVP report") if args.acvp else None
+        return run_bulk(args.cbom, args.strict, args.profile, args.json)
 
-    doc = check(bom, report, base, args.strict, args.profile)
+    path = args.cbom[0]
+    try:
+        bom, digests = _load_cbom(path)
+        hashes = {"cbom": digests}
+        base = None
+        if args.baseline:
+            base, hashes["baseline"] = load_json(args.baseline, "baseline")
+            if not isinstance(base, dict):
+                raise InputError("baseline top level is not a JSON object")
+        report = None
+        if args.acvp:
+            report, hashes["acvp"] = load_json(args.acvp, "ACVP report")
+    except InputError as e:
+        print(f"INPUT_ERROR: {e}", file=sys.stderr)
+        return 2
+
+    doc = check(bom, report, base, args.strict, args.profile, hashes)
     exit_code = doc["summary"]["exit_code"]
 
     if args.json:
-        doc = {"cbom": args.cbom, **doc}
+        doc = {"cbom": path, **doc}
         if args.acvp:
             doc["acvp_extraction"] = {"report": args.acvp, **doc["acvp_extraction"]}
         print(json.dumps(doc, indent=2))
         return exit_code
 
     s = doc["summary"]
-    print(f"cbom_check: {args.cbom}")
+    print(f"cbom_check {__version__}: {path} (sha256 {hashes['cbom'][:16]}…)")
     print(f"  Schema (CycloneDX {doc['schema']['version']}): "
           f"{'PASS' if doc['schema']['valid'] else 'FAIL'}")
     print(f"  NOTE: {SCHEMA_NOTE}")
@@ -756,6 +954,13 @@ def run(argv: Optional[list[str]] = None) -> int:
         for e in ex["algorithms"]:
             raw = "" if e["raw_value"] == e["name"] else f" (in {e['raw_value']!r})"
             print(f"    - {e['name']!r}{raw} from {e['field']}")
+    if "baseline_diff" in doc:
+        d = doc["baseline_diff"]
+        print(f"  Since baseline {args.baseline}: {len(d['added'])} added, "
+              f"{len(d['removed'])} removed, {len(d['changed'])} changed")
+        for kind, sign in (("added", "+"), ("removed", "-"), ("changed", "~")):
+            for name in d[kind]:
+                print(f"    {sign} {name}")
     print()
     if not doc["findings"]:
         print("  No semantic findings.")
