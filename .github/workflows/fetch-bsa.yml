@@ -1,0 +1,27 @@
+name: One-off fetch of the BSA 2023 Schedule text
+
+# Temporary: downloads the official Act PDF (Ministry of Home Affairs) and
+# prints the Schedule (the section 63(4)(c) certificate). Removed after one run.
+on:
+  push:
+    branches: [claude/amazing-bohr-ntvs0u]
+    paths: [.github/workflows/fetch-bsa.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and extract
+        run: |
+          sudo apt-get install -y -qq poppler-utils >/dev/null
+          curl -sSL -o bsa.pdf "https://www.mha.gov.in/sites/default/files/2024-04/250882_english_01042024_0.pdf"
+          sha256sum bsa.pdf
+          pdfinfo bsa.pdf | head -20
+          pdftotext -layout bsa.pdf bsa.txt
+          echo "===== SECTION 63 ====="
+          awk '/^ *63\. *\(1\)/,/^ *64\./' bsa.txt
+          echo "===== SCHEDULE ====="
+          awk '/THE SCHEDULE/{f=1} f' bsa.txt
