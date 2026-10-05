@@ -1,0 +1,29 @@
+name: One-off domain health check
+
+# Temporary diagnostic: public DNS records only. Removed after one run.
+on:
+  push:
+    branches: [claude/amazing-bohr-ntvs0u]
+    paths: [.github/workflows/domain-check.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  dns:
+    runs-on: ubuntu-latest
+    steps:
+      - name: DNS records
+        run: |
+          for q in "actaseal.com MX" "actaseal.com TXT" "_dmarc.actaseal.com TXT" "default._domainkey.actaseal.com TXT" \
+                   "actaseal.com CAA" "verify.actaseal.com CNAME" "cbom.actaseal.com CNAME" "app.actaseal.com A" \
+                   "www.actaseal.com CNAME"; do
+            set -- $q
+            echo "== $1 $2"; dig +short "$1" "$2" || true
+          done
+      - name: HTTPS status
+        run: |
+          for u in https://actaseal.com https://www.actaseal.com https://verify.actaseal.com https://verify.actaseal.com/browser/ \
+                   https://cbom.actaseal.com https://actaseal.com/.well-known/security.txt https://actaseal-verify.pages.dev/; do
+            echo "$u -> $(curl -sS -m 20 -o /dev/null -w '%{http_code} %{redirect_url}' "$u" || echo ERR)"
+          done
