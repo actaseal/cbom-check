@@ -1,0 +1,35 @@
+name: One-off action self-test
+
+# Temporary: runs the composite action from this checkout. Removed after one run.
+on:
+  push:
+    branches: [claude/amazing-bohr-ntvs0u]
+    paths: [.github/workflows/action-selftest.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  clean-passes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          cbom: fixtures/clean.json
+          acvp: fixtures/acvp_clean.json
+          baseline: fixtures/baseline.json
+          strict: "true"
+  broken-fails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        continue-on-error: true
+        uses: ./
+        with:
+          cbom: fixtures/nist_level_mismatch.json
+      - name: Expect failure
+        run: |
+          echo "outcome=${{ steps.check.outcome }}"
+          [ "${{ steps.check.outcome }}" = "failure" ]
