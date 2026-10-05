@@ -45,6 +45,12 @@ jobs:
           baseline: fixtures/baseline.json
           profile: cert-in
           strict: "true"
+      - name: Several profiles pass through the action
+        uses: ./
+        with:
+          cbom: fixtures/cnsa2_compliant.json
+          profile: "weak, cnsa2"
+          strict: "true"
       - name: Broken CBOM fails the action
         id: broken
         continue-on-error: true

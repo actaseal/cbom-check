@@ -13,14 +13,15 @@ named reason code and a non-zero exit, so it can gate CI.
 ```
 pip install -r requirements.txt
 python cbom_check.py <cbom.json> [--acvp <report.json>] [--baseline <previous_cbom.json>]
-                     [--profile cert-in] [--inventory] [--strict] [--json]
+                     [--profile cert-in|weak|cnsa2 ...] [--inventory] [--strict] [--json]
+python cbom_check.py <cbom.json> <cbom.json> ... [--profile ...] [--strict] [--json]   # bulk
 ```
 
 Example:
 
 ```
 $ python cbom_check.py fixtures/nist_level_mismatch.json
-cbom_check: fixtures/nist_level_mismatch.json
+cbom_check 1.1.0: fixtures/nist_level_mismatch.json (sha256 269a0c42c03fdda0…)
   Schema (CycloneDX 1.6): PASS
   NOTE: Schema validation passing does NOT mean the CBOM is semantically correct. The schema checks shape; the checks below check meaning.
 
@@ -34,7 +35,10 @@ $ echo $?
 ```
 
 `--json` prints the same result as machine-readable JSON (schema result, findings,
-ACVP extraction details, summary with `exit_code`).
+ACVP extraction details, baseline diff, summary with `exit_code`). The result also names
+the SHA-256 of every input file and the checker version (`inputs`, `tool`), so anyone can
+re-run the same files and get the same result. That is not a timestamp: for proof of
+*when* a CBOM passed, the result has to be sealed (ActaSeal does this).
 
 ### Exit codes
 
@@ -72,6 +76,13 @@ fixtures/missing.json                          -> exit 2
 | `CBOM_ALGORITHM_NOT_TESTED` | error | With `--acvp`: algorithm in the CBOM, not in the test report. |
 | `ALGORITHM_NAME_MISMATCH` | error | With `--acvp`: same algorithm in both, spelled differently (e.g. `SHA-256` vs `SHA2-256`, `ECDH` vs `KAS-ECC`). Case is ignored. |
 | `CBOM_CERTIN_ELEMENT_MISSING` | error | With `--profile cert-in`: an asset lacks a CERT-In CBOM minimum element. Algorithms: primitive, crypto functions, classical security level, OID, and mode for block ciphers / AE. Keys: ID, size, creation and activation date. Certificates: subject, issuer, validity, signature algorithm reference, format, extension. |
+| `CBOM_WEAK_ALGORITHM` | error / warning | With `--profile weak` (NIST SP 800-131A Rev. 2, FIPS 186-5). Errors: MD5, Triple DES, RSA below 2048 bits. Warnings: SHA-1 (disallowed for signature generation, retired by 2030), DSA (verification only). |
+| `CBOM_CNSA2_NOT_ALLOWED` | error | With `--profile cnsa2` (NSA CNSA 2.0): an algorithm outside AES-256, SHA-384/SHA-512, ML-KEM-1024, ML-DSA-87 and LMS/XMSS, e.g. AES-128, SHA-256, SHA-3, ML-KEM-768, SLH-DSA. AES without a stated key size counts as not allowed. |
+| `CBOM_CNSA2_TRANSITIONAL` | warning (error with `--strict`) | With `--profile cnsa2`: a classical public-key algorithm (RSA, ECDSA, ECDH, EdDSA, X25519, DH, DSA), allowed only during the transition. |
+
+Profiles combine: `--profile weak --profile cnsa2`. They judge which algorithms the CBOM
+lists, not whether the CBOM is correct, so they are opt-in. Key sizes are read from the
+algorithm name and `parameterSetIdentifier`; an RSA entry with no size is not judged.
 
 The element list for `--profile cert-in` follows CERT-In's *Technical Guidelines on SBOM, QBOM & CBOM, AIBOM and HBOM* v2.0 as summarised in published guides; check it against the official PDF before relying on it for a submission.
 
@@ -94,10 +105,35 @@ If any match comes from a field whose own name contains `alg` (`algorithm`, `alg
 lists every extracted name and the JSON field it came from, so you can see what
 was compared.
 
+### Changes since the previous CBOM
+
+With `--baseline`, the result lists which components were added, removed or changed
+(matched by `bom-ref`, or by name when there is none), alongside the serialNumber and
+timestamp refresh checks.
+
+### Bulk mode
+
+Pass several CBOMs to check them in one run (e.g. `vendors/*.json`):
+
+```
+$ python cbom_check.py fixtures/clean.json fixtures/cnsa2_compliant.json fixtures/weak_algorithm.json --profile weak
+cbom_check (bulk): 3 file(s), profile(s): weak
+  PASS    0 error(s)   0 warning(s)  fixtures/clean.json
+  PASS    0 error(s)   0 warning(s)  fixtures/cnsa2_compliant.json
+  FAIL    1 error(s)   0 warning(s)  fixtures/weak_algorithm.json  [CBOM_WEAK_ALGORITHM]
+
+  1 of 3 file(s) failed -> exit 1
+```
+
+The exit code is the worst file's (2 if any file could not be read). `--acvp` and
+`--baseline` belong to one CBOM, so they are refused in bulk mode. The web page does the
+same when several CBOMs are selected.
+
 ## What is not checked
 
 - Whether the inventory is complete (the tool sees only the CBOM, not your code).
-- Certificate contents, key lengths, validity periods, or `classicalSecurityLevel`.
+- Certificate contents, validity periods, or `classicalSecurityLevel`. Key sizes only through the
+  `weak` and `cnsa2` profiles, and only where the size is in the algorithm name or `parameterSetIdentifier`.
 - Whether an algorithm is *configured* safely (modes, padding, nonces).
 - ACVP certificate authenticity; the report is only parsed for algorithm names.
 - Algorithms outside the built-in name catalogue (see `_CATALOGUE` in `cbom_check.py`).
@@ -115,7 +151,7 @@ was compared.
     cbom: build/cbom.json
     acvp: reports/acvp.json        # optional
     baseline: previous/cbom.json   # optional
-    profile: cert-in               # optional
+    profile: cert-in,cnsa2         # optional, comma-separated: cert-in, weak, cnsa2
     strict: "true"                 # optional
 ```
 

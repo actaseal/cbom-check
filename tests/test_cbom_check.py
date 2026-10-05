@@ -43,6 +43,9 @@ BAD = [
     ("clean.json", ["--acvp", FIX / "acvp_algorithm_name_mismatch.json"], "ALGORITHM_NAME_MISMATCH"),
     ("clean.json", ["--profile", "cert-in"], "CBOM_CERTIN_ELEMENT_MISSING"),
     ("unsupported_spec_version.json", [], "CBOM_SCHEMA_INVALID"),
+    ("weak_algorithm.json", ["--profile", "weak"], "CBOM_WEAK_ALGORITHM"),
+    ("cnsa2_not_allowed.json", ["--profile", "cnsa2"], "CBOM_CNSA2_NOT_ALLOWED"),
+    ("cnsa2_transitional.json", ["--profile", "cnsa2", "--strict"], "CBOM_CNSA2_TRANSITIONAL"),
 ]
 
 
@@ -60,7 +63,8 @@ def test_every_reason_code_has_a_fixture():
         "CBOM_PARAMETER_SET_NAME_INCOMPLETE", "CBOM_NO_CLASSICAL_ALGORITHMS",
         "CBOM_SERIALNUMBER_NOT_REFRESHED", "CBOM_TIMESTAMP_NOT_REFRESHED",
         "ACVP_ALGORITHM_NOT_IN_CBOM", "CBOM_ALGORITHM_NOT_TESTED", "ALGORITHM_NAME_MISMATCH",
-        "CBOM_CERTIN_ELEMENT_MISSING",
+        "CBOM_CERTIN_ELEMENT_MISSING", "CBOM_WEAK_ALGORITHM", "CBOM_CNSA2_NOT_ALLOWED",
+        "CBOM_CNSA2_TRANSITIONAL",
     }
     assert {b[2] for b in BAD} == expected
 
@@ -251,3 +255,177 @@ def test_inventory_marks_quantum_status_and_follows_references():
 def test_inventory_hybrid_group():
     bom = _bom(_alg("X25519MLKEM768", 3))
     assert cbom_check.inventory(bom)[0]["quantum"] == "hybrid"
+
+
+# --------------------------------------------------------------------------
+# Policy profiles: weak (NIST SP 800-131A Rev. 2 / FIPS 186-5) and cnsa2
+# --------------------------------------------------------------------------
+
+def _policy(profile, *names):
+    bom = _bom(*(_alg(n) for n in names))
+    return [(f.code, f.severity, f.message.split("'")[1]) for f in cbom_check.check_policy(bom, profile)]
+
+
+@pytest.mark.parametrize("name,severity", [
+    ("MD5", "error"), ("3DES", "error"), ("TDEA", "error"), ("RSA-1024", "error"),
+    ("SHA-1", "warning"), ("DSA", "warning"),
+])
+def test_weak_profile_flags(name, severity):
+    assert _policy("weak", name) == [("CBOM_WEAK_ALGORITHM", severity, name)]
+
+
+@pytest.mark.parametrize("name", ["RSA-2048", "RSA-4096", "RSA", "AES-128-GCM", "SHA-256",
+                                  "HMAC-SHA-1", "ECDSA", "ML-KEM-512"])
+def test_weak_profile_leaves_acceptable_or_unsized_alone(name):
+    assert _policy("weak", name) == []
+
+
+def test_weak_profile_reads_rsa_size_from_parameter_set_identifier():
+    bom = _bom(_alg("RSA", psi="1024"))
+    assert [f.code for f in cbom_check.check_policy(bom, "weak")] == ["CBOM_WEAK_ALGORITHM"]
+
+
+@pytest.mark.parametrize("name", ["AES-256-GCM", "SHA-384", "SHA-512", "ML-KEM-1024", "ML-DSA-87",
+                                  "LMS", "XMSS"])
+def test_cnsa2_allows(name):
+    assert _policy("cnsa2", name) == []
+
+
+@pytest.mark.parametrize("name", ["AES-128-GCM", "AES-192", "AES", "SHA-256", "SHA3-384", "SHAKE256",
+                                  "ML-KEM-768", "ML-DSA-65", "SLH-DSA-SHA2-256s", "SHA-1", "MD5",
+                                  "3DES", "ChaCha20"])
+def test_cnsa2_not_allowed(name):
+    assert _policy("cnsa2", name) == [("CBOM_CNSA2_NOT_ALLOWED", "error", name)]
+
+
+@pytest.mark.parametrize("name", ["RSA-3072", "ECDSA", "ECDH", "Ed25519", "X25519", "DH", "DSA"])
+def test_cnsa2_classical_public_key_is_transitional(name):
+    assert _policy("cnsa2", name) == [("CBOM_CNSA2_TRANSITIONAL", "warning", name)]
+
+
+def test_cnsa2_hybrid_reports_both_halves():
+    assert sorted(_policy("cnsa2", "X25519MLKEM768")) == [
+        ("CBOM_CNSA2_NOT_ALLOWED", "error", "MLKEM768"),
+        ("CBOM_CNSA2_TRANSITIONAL", "warning", "X25519"),
+    ]
+
+
+def test_cnsa2_compliant_fixture_passes_strict():
+    rc, doc = run(FIX / "cnsa2_compliant.json", "--profile", "cnsa2", "--strict")
+    assert doc["findings"] == [] and rc == 0
+
+
+def test_profiles_combine_and_are_reported():
+    rc, doc = run(FIX / "weak_algorithm.json", "--profile", "weak", "--profile", "cnsa2")
+    assert {"CBOM_WEAK_ALGORITHM", "CBOM_CNSA2_NOT_ALLOWED", "CBOM_CNSA2_TRANSITIONAL"} <= codes(doc)
+    assert doc["summary"]["profiles"] == ["weak", "cnsa2"]
+    assert doc["summary"]["profile"] == "weak,cnsa2"
+    assert rc == 1
+
+
+def test_single_profile_keeps_its_name():
+    _, doc = run(FIX / "clean.json", "--profile", "cert-in")
+    assert doc["summary"]["profile"] == "cert-in" and doc["summary"]["profiles"] == ["cert-in"]
+
+
+def test_policy_checks_skip_non_algorithm_assets():
+    bom = json.loads((FIX / "clean.json").read_text())
+    locs = {f.location for f in cbom_check.check_policy(bom, "cnsa2")}
+    assert not any("TLS" in loc or "certificate" in loc for loc in locs)
+
+
+# --------------------------------------------------------------------------
+# Baseline diff
+# --------------------------------------------------------------------------
+
+def test_baseline_diff_lists_added_removed_and_changed():
+    base = json.loads((FIX / "clean.json").read_text())
+    bom = json.loads((FIX / "clean.json").read_text())
+    bom["components"] = [c for c in bom["components"] if c["bom-ref"] != "alg-ecdh"]
+    bom["components"][0]["name"] = "RSA-3072"
+    bom["components"].append({"type": "cryptographic-asset", "bom-ref": "alg-mldsa87", "name": "ML-DSA-87"})
+    diff = cbom_check.baseline_diff(bom, base)
+    assert diff == {"added": ["ML-DSA-87 (alg-mldsa87)"], "removed": ["ECDH (alg-ecdh)"],
+                    "changed": ["RSA-3072 (alg-rsa)"]}
+
+
+def test_baseline_diff_matches_by_name_without_bom_ref():
+    a = {"components": [{"name": "X", "type": "library"}]}
+    b = {"components": [{"name": "X", "type": "library", "version": "2"}]}
+    assert cbom_check.baseline_diff(b, a) == {"added": [], "removed": [], "changed": ["X"]}
+
+
+def test_baseline_diff_is_in_the_result():
+    _, doc = run(FIX / "clean.json", "--baseline", FIX / "baseline.json")
+    assert doc["baseline_diff"] == {"added": ["SLH-DSA-SHA2-128s (alg-slhdsa)"], "removed": [], "changed": []}
+
+
+def test_no_baseline_no_diff():
+    _, doc = run(FIX / "clean.json")
+    assert "baseline_diff" not in doc
+
+
+# --------------------------------------------------------------------------
+# Result names its exact inputs and the tool version
+# --------------------------------------------------------------------------
+
+def test_result_carries_input_hashes_and_tool_version():
+    import hashlib
+    _, doc = run(FIX / "clean.json", "--acvp", FIX / "acvp_clean.json", "--baseline", FIX / "baseline.json")
+    for kind, name in [("cbom", "clean.json"), ("acvp", "acvp_clean.json"), ("baseline", "baseline.json")]:
+        assert doc["inputs"][kind]["sha256"] == hashlib.sha256((FIX / name).read_bytes()).hexdigest()
+    assert doc["tool"] == {"name": "cbom-check", "version": cbom_check.__version__}
+
+
+def test_input_hash_covers_raw_bytes_including_utf8_bom(tmp_path):
+    import hashlib
+    p = tmp_path / "bom.json"
+    raw = b"\xef\xbb\xbf" + (FIX / "clean.json").read_bytes()
+    p.write_bytes(raw)
+    _, doc = run(p)
+    assert doc["inputs"]["cbom"]["sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# Bulk mode
+# --------------------------------------------------------------------------
+
+def run_bulk(*args):
+    proc = subprocess.run([sys.executable, str(ROOT / "cbom_check.py"), *map(str, args)],
+                          capture_output=True, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def test_bulk_json_reports_every_file_and_worst_exit():
+    rc, out, _ = run_bulk(FIX / "clean.json", FIX / "nist_level_mismatch.json", "--json")
+    doc = json.loads(out)
+    assert [r["cbom"] for r in doc["results"]] == [str(FIX / "clean.json"), str(FIX / "nist_level_mismatch.json")]
+    assert [r["summary"]["exit_code"] for r in doc["results"]] == [0, 1]
+    assert doc["summary"] == {"files": 2, "passed": 1, "failed": 1, "unreadable": 0, "exit_code": 1}
+    assert rc == 1
+
+
+def test_bulk_text_has_one_line_per_file():
+    rc, out, _ = run_bulk(FIX / "clean.json", FIX / "nist_level_mismatch.json")
+    assert "PASS" in out and "FAIL" in out and "CBOM_NIST_LEVEL_MISMATCH" in out
+    assert "1 of 2 file(s) failed" in out
+    assert rc == 1
+
+
+def test_bulk_unreadable_file_is_reported_and_exits_two():
+    rc, out, _ = run_bulk(FIX / "clean.json", FIX / "nope.json", "--json")
+    doc = json.loads(out)
+    assert doc["results"][1]["input_error"].startswith("cannot read CBOM")
+    assert doc["summary"]["unreadable"] == 1
+    assert rc == 2
+
+
+def test_bulk_all_clean_exits_zero():
+    rc, _, _ = run_bulk(FIX / "clean.json", FIX / "clean_v1_7.json")
+    assert rc == 0
+
+
+@pytest.mark.parametrize("opt", ["--acvp", "--baseline"])
+def test_bulk_rejects_per_file_options(opt):
+    rc, _, err = run_bulk(FIX / "clean.json", FIX / "clean.json", opt, FIX / "baseline.json")
+    assert rc == 2 and "one CBOM" in err

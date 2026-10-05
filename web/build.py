@@ -34,7 +34,8 @@ PYODIDE_CORE = ["pyodide.mjs", "pyodide.asm.mjs", "pyodide.asm.wasm",
 PYODIDE_PACKAGES = ["jsonschema", "jsonpointer", "sortedcontainers", "idna",
                     "python-dateutil", "tzdata", "typing-extensions"]
 SITE_FILES = ["index.html", "app.js", ".htaccess"]
-SAMPLES = ["clean.json", "nist_level_mismatch.json", "no_classical_algorithms.json"]
+SAMPLES = ["clean.json", "nist_level_mismatch.json", "no_classical_algorithms.json",
+           "cnsa2_compliant.json"]
 
 
 def sha256(path: Path) -> str:
